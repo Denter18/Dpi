@@ -24,7 +24,7 @@ jobs:
           path: |
             .buildozer
             ~/.buildozer
-          key: buildozer-v2-${{ runner.os }}
+          key: buildozer-v3-${{ runner.os }}
 
       - name: Prepare project files and p4a hook via Python
         run: |
@@ -134,8 +134,9 @@ jobs:
           with open("p4a_hook.py", "w") as f:
               f.write("\n".join(line[10:] if line.startswith("          ") else line for line in hook_code.splitlines()))
 
-          # 4. Создаем buildozer.spec
-          spec = """[app]
+          # 4. Создаем buildozer.spec с привязкой к системному Android SDK
+          sdk_root = os.environ.get("ANDROID_SDK_ROOT", "/usr/local/lib/android/sdk")
+          spec = f"""[app]
           title = NoDPI v2.3
           package.name = nodpi
           package.domain = org.gvcoder
@@ -149,6 +150,7 @@ jobs:
           android.api = 33
           android.minapi = 24
           android.ndk = 25b
+          android.sdk_path = {sdk_root}
           android.accept_sdk_license = True
           android.archs = arm64-v8a
           android.add_src = java_src
@@ -163,11 +165,16 @@ jobs:
               f.write("\n".join(line.strip() for line in spec.splitlines()))
           '
 
-      - name: Pre-accept Android SDK licenses
+      - name: Configure Pre-installed Android SDK for Buildozer
         run: |
-          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
-          printf "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n" > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
-          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
+          # Buildozer ищет sdkmanager по старому пути tools/bin/sdkmanager, создадим симлинк на новый cmdline-tools
+          SDK_DIR="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          mkdir -p "$SDK_DIR/tools/bin"
+          if [ -f "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            ln -sf "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" "$SDK_DIR/tools/bin/sdkmanager"
+          fi
+          yes | "$SDK_DIR/tools/bin/sdkmanager" --licenses || true
+          "$SDK_DIR/tools/bin/sdkmanager" "platforms;android-33" "build-tools;33.0.2" "platform-tools"
 
       - name: Install system dependencies and Buildozer
         run: |
@@ -179,13 +186,9 @@ jobs:
           pip install --upgrade pip "setuptools<69.0.0" wheel virtualenv
           pip install "cython==0.29.36" git+https://github.com/kivy/buildozer.git@master
 
-      - name: Build APK with Buildozer (auto-confirm licenses)
+      - name: Build APK with Buildozer
         run: |
-          yes | buildozer android debug || true
-          if ! ls bin/*.apk 1> /dev/null 2>&1; then
-            echo "APK was not generated, failing step..."
-            exit 1
-          fi
+          buildozer android debug
 
       - name: Upload APK to Artifacts
         uses: actions/upload-artifact@v4
