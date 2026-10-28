@@ -13,21 +13,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Fix file names if uploaded as .txt
-        run: |
-          if [ -f "main_py.txt" ] && [ ! -f "main.py" ]; then
-            mv main_py.txt main.py
-          fi
-          if [ -f "main.py.txt" ] && [ ! -f "main.py" ]; then
-            mv main.py.txt main.py
-          fi
-          rm -rf java_src
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-      - name: Generate Java VPN Service and Manifest Extra
+      - name: Prepare project files via Python (safe from YAML indentation issues)
         run: |
-          mkdir -p java_src/org/gvcoder/nodpi
-          cat << 'EOF' > java_src/org/gvcoder/nodpi/NoDpiVpnService.java
-          package org.gvcoder.nodpi;
+          python3 -c '
+          import os, shutil
+
+          # 1. Проверяем имя main.py
+          for alt in ["main_py.txt", "main.py.txt"]:
+              if os.path.exists(alt) and not os.path.exists("main.py"):
+                  shutil.move(alt, "main.py")
+
+          # 2. Создаем Java-сервис VPN
+          java_dir = "java_src/org/gvcoder/nodpi"
+          os.makedirs(java_dir, exist_ok=True)
+
+          java_code = """package org.gvcoder.nodpi;
 
           import android.content.Intent;
           import android.net.ProxyInfo;
@@ -92,22 +97,24 @@ jobs:
                   super.onDestroy();
               }
           }
-          EOF
+          """
+          with open(os.path.join(java_dir, "NoDpiVpnService.java"), "w") as f:
+              f.write(java_code)
 
-          cat << 'EOF' > manifest_extra.xml
-          <service android:name="org.gvcoder.nodpi.NoDpiVpnService"
+          # 3. Создаем manifest_extra.xml
+          manifest_xml = """<service android:name="org.gvcoder.nodpi.NoDpiVpnService"
                    android:permission="android.permission.BIND_VPN_SERVICE"
                    android:exported="false">
               <intent-filter>
                   <action android:name="android.net.VpnService"/>
               </intent-filter>
-          </service>
-          EOF
+          </service>"""
+          manifest_path = os.path.abspath("manifest_extra.xml")
+          with open(manifest_path, "w") as f:
+              f.write(manifest_xml)
 
-      - name: Generate buildozer.spec with absolute paths
-        run: |
-          cat << EOF > buildozer.spec
-          [app]
+          # 4. Создаем buildozer.spec
+          spec = f"""[app]
           title = NoDPI v2.3
           package.name = nodpi
           package.domain = org.gvcoder
@@ -123,19 +130,17 @@ jobs:
           android.ndk = 25b
           android.accept_sdk_license = True
           android.archs = arm64-v8a
-          android.add_src = %(source.dir)s/java_src
-          android.extra_manifest_application_arguments = ${GITHUB_WORKSPACE}/manifest_extra.xml
-          p4a.branch = develop
+          android.add_src = java_src
+          android.extra_manifest_application_arguments = {manifest_path}
+          p4a.branch = master
 
           [buildozer]
           log_level = 2
           warn_on_root = 0
-          EOF
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+          """
+          with open("buildozer.spec", "w") as f:
+              f.write("\n".join(line.strip() for line in spec.splitlines()))
+          '
 
       - name: Install system dependencies and Buildozer
         run: |
@@ -143,9 +148,9 @@ jobs:
           sudo apt-get install -y \
             git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake \
-            libffi-dev libssl-dev automake autopoint gettext
-          pip install --upgrade pip "setuptools<69.0.0" wheel
-          pip install "cython==0.29.36" buildozer==1.5.0
+            libffi-dev libssl-dev automake autopoint gettext libltdl-dev
+          pip install --upgrade pip "setuptools<69.0.0" wheel virtualenv
+          pip install "cython==0.29.36" git+https://github.com/kivy/buildozer.git@master
 
       - name: Build APK with Buildozer
         run: |
