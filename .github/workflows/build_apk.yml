@@ -1,0 +1,105 @@
+name: Build NoDPI v2.3 APK
+
+
+
+on:
+
+  push:
+
+    branches: [ "main", "master" ]
+
+  workflow_dispatch:
+
+
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-22.04
+
+
+
+    steps:
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+
+
+      - name: Generate buildozer.spec
+
+        run: |
+
+          cat << 'EOF' > buildozer.spec
+
+          [app]
+
+          title = NoDPI v2.3
+
+          package.name = nodpi
+
+          package.domain = org.gvcoder
+
+          source.dir = .
+
+          source.include_exts = py,png,jpg,kv,atlas,txt
+
+          version = 2.3.0
+
+          requirements = python3,kivy==2.3.0
+
+          orientation = portrait
+
+          fullscreen = 0
+
+          android.permissions = INTERNET,ACCESS_NETWORK_STATE,FOREGROUND_SERVICE
+
+          android.api = 33
+
+          android.minapi = 24
+
+          android.ndk = 25b
+
+          android.accept_sdk_license = True
+
+          android.archs = arm64-v8a, armeabi-v7a
+
+          p4a.branch = master
+
+
+
+          [buildozer]
+
+          log_level = 2
+
+          warn_on_root = 0
+
+          EOF
+
+
+
+      - name: Build APK with Buildozer Action
+
+        uses: ArtemSBulgakov/buildozer-action@v1
+
+        id: buildozer
+
+        with:
+
+          command: buildozer android debug
+
+          buildozer_version: stable
+
+
+
+      - name: Upload APK to Artifacts
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: NoDPI-v2.3-Android-APK
+
+          path: ${{ steps.buildozer.outputs.filename }}
