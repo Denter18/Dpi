@@ -18,7 +18,15 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Prepare project files via Python (safe from YAML indentation issues)
+      - name: Cache Buildozer directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            .buildozer
+            ~/.buildozer
+          key: buildozer-v2-${{ runner.os }}
+
+      - name: Prepare project files and p4a hook via Python
         run: |
           python3 -c '
           import os, shutil
@@ -101,25 +109,38 @@ jobs:
           with open(os.path.join(java_dir, "NoDpiVpnService.java"), "w") as f:
               f.write(java_code)
 
-          # 3. Создаем manifest_extra.xml
-          manifest_xml = """<service android:name="org.gvcoder.nodpi.NoDpiVpnService"
-                   android:permission="android.permission.BIND_VPN_SERVICE"
-                   android:exported="false">
-              <intent-filter>
-                  <action android:name="android.net.VpnService"/>
-              </intent-filter>
-          </service>"""
-          manifest_path = os.path.abspath("manifest_extra.xml")
-          with open(manifest_path, "w") as f:
-              f.write(manifest_xml)
+          # 3. Создаем p4a hook для добавления <service> в AndroidManifest.xml
+          hook_code = """from pathlib import Path
+
+          def after_apk_build(toolchain):
+              pass
+
+          def before_apk_build(toolchain):
+              for p in Path(toolchain.dist_dir).rglob("AndroidManifest.xml"):
+                  if "src/main" in str(p):
+                      content = p.read_text(encoding="utf-8")
+                      vpn_service_xml = (
+                          "<service android:name=\\"org.gvcoder.nodpi.NoDpiVpnService\\" "
+                          "android:permission=\\"android.permission.BIND_VPN_SERVICE\\" "
+                          "android:exported=\\"false\\">"
+                          "<intent-filter><action android:name=\\"android.net.VpnService\\"/></intent-filter>"
+                          "</service></application>"
+                      )
+                      if "NoDpiVpnService" not in content:
+                          content = content.replace("</application>", vpn_service_xml)
+                          p.write_text(content, encoding="utf-8")
+                          print("Injected NoDpiVpnService into", p)
+          """
+          with open("p4a_hook.py", "w") as f:
+              f.write("\n".join(line[10:] if line.startswith("          ") else line for line in hook_code.splitlines()))
 
           # 4. Создаем buildozer.spec
-          spec = f"""[app]
+          spec = """[app]
           title = NoDPI v2.3
           package.name = nodpi
           package.domain = org.gvcoder
           source.dir = .
-          source.include_exts = py,png,jpg,kv,atlas,txt,xml
+          source.include_exts = py,png,jpg,kv,atlas,txt
           version = 2.3.1
           requirements = python3,kivy==2.3.0,pyjnius
           orientation = portrait
@@ -131,8 +152,8 @@ jobs:
           android.accept_sdk_license = True
           android.archs = arm64-v8a
           android.add_src = java_src
-          android.extra_manifest_application_arguments = {manifest_path}
           p4a.branch = master
+          p4a.hook = p4a_hook.py
 
           [buildozer]
           log_level = 2
@@ -141,6 +162,12 @@ jobs:
           with open("buildozer.spec", "w") as f:
               f.write("\n".join(line.strip() for line in spec.splitlines()))
           '
+
+      - name: Pre-accept Android SDK licenses
+        run: |
+          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
+          printf "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n" > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
 
       - name: Install system dependencies and Buildozer
         run: |
@@ -152,9 +179,13 @@ jobs:
           pip install --upgrade pip "setuptools<69.0.0" wheel virtualenv
           pip install "cython==0.29.36" git+https://github.com/kivy/buildozer.git@master
 
-      - name: Build APK with Buildozer
+      - name: Build APK with Buildozer (auto-confirm licenses)
         run: |
-          buildozer android debug
+          yes | buildozer android debug || true
+          if ! ls bin/*.apk 1> /dev/null 2>&1; then
+            echo "APK was not generated, failing step..."
+            exit 1
+          fi
 
       - name: Upload APK to Artifacts
         uses: actions/upload-artifact@v4
