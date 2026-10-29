@@ -72,14 +72,24 @@ jobs:
           set -o pipefail
           buildozer -v android debug 2>&1 | tee build.log
 
-      # Если сборка упала, выводим хвост лога и строки с ошибками в аннотации
-      # запуска - их можно прочитать без скачивания логов.
+      # Если сборка упала, выводим нужную часть лога в аннотации запуска -
+      # их можно прочитать без скачивания логов.
       - name: Report build errors
         if: failure()
         run: |
-          enc() { sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}'; }
-          echo "::error title=Buildozer log tail::$(tail -n 60 build.log | enc)"
-          echo "::error title=Buildozer error lines::$(grep -n -i -E 'error|exception|failed|not found|No such|FAILURE' build.log | tail -n 40 | enc)"
+          # без ANSI-цветов, длинные строки обрезаны
+          sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r//g' build.log | cut -c1-300 > clean.log
+          # граница: начало дампа окружения, который печатает buildozer при ошибке
+          END=$(grep -n -m1 -E '^# +ENVIRONMENT|^# Command failed' clean.log | cut -d: -f1)
+          END=${END:-$(wc -l < clean.log)}
+          echo "failure marker at line $END of $(wc -l < clean.log)"
+          enc() { sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}'; }
+          head -n "$END" clean.log | grep -v -E "^Compiling |^\[DEBUG\].*running zip" | tail -n 25 | enc > part1.txt
+          echo "::error title=Before failure::$(cat part1.txt)"
+          grep -E '^# Command failed' clean.log | head -n 2 | enc > part2.txt
+          echo "::error title=Failed command::$(cat part2.txt)"
+          head -n "$END" clean.log | grep -n -E '(^|[^a-zA-Z_])(ERROR|Error:|error:|FAILED|Exception|Traceback|not found|No such file|cannot find)' | grep -v -E 'Compiling |/Lib/test/' | tail -n 20 | enc > part3.txt
+          echo "::error title=Error lines::$(cat part3.txt)"
 
       - name: Show built APK
         run: ls -lh bin/*.apk
