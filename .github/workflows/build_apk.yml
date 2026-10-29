@@ -69,7 +69,17 @@ jobs:
 
       - name: Build APK with Buildozer
         run: |
-          buildozer -v android debug
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
+
+      # Если сборка упала, выводим хвост лога и строки с ошибками в аннотации
+      # запуска - их можно прочитать без скачивания логов.
+      - name: Report build errors
+        if: failure()
+        run: |
+          enc() { sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}'; }
+          echo "::error title=Buildozer log tail::$(tail -n 60 build.log | enc)"
+          echo "::error title=Buildozer error lines::$(grep -n -i -E 'error|exception|failed|not found|No such|FAILURE' build.log | tail -n 40 | enc)"
 
       - name: Show built APK
         run: ls -lh bin/*.apk
