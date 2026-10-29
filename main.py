@@ -16,10 +16,17 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.switch import Switch
 from kivy.uix.textinput import TextInput
+from kivy.utils import platform
 
 
 # Настройка цвета фона окна
 Window.clearcolor = (0.12, 0.12, 0.14, 1)
+
+# Сколько ждать ClientHello от клиента после "200 Connection Established" (сек)
+HELLO_TIMEOUT = 5.0
+# Сколько ждать первый ответ сервера в режиме автоопределения (сек).
+# Если за это время пришёл RST/EOF/тишина - считаем, что домен блокируется DPI.
+AUTODETECT_TIMEOUT = 4.0
 
 
 # =====================================================================
@@ -36,6 +43,7 @@ class NoDPIEngine:
         mode="all",
         domains=None,
         log_cb=None,
+        stopped_cb=None,
     ):
         self.host = host
         self.port = int(port)
@@ -46,8 +54,12 @@ class NoDPIEngine:
         )
         self.autodetected = set()
         self.log_cb = log_cb or (lambda msg: None)
+        # Вызывается (из потока прокси), если сервер остановился сам - например,
+        # из-за занятого порта. Нужен, чтобы интерфейс сбросил кнопку.
+        self.stopped_cb = stopped_cb
         self.server = None
         self.loop = None
+        self._main_task = None
         self.running = False
 
     def log(self, msg):
@@ -145,27 +157,97 @@ class NoDPIEngine:
     async def read_full_client_hello(
         reader: asyncio.StreamReader,
     ) -> bytes:
-        """Фича v2.3: Полное чтение TLS-записи ClientHello (для поддержки больших Kyber-пакетов)."""
-        header = await asyncio.wait_for(reader.read(5), timeout=10.0)
+        """Фича v2.3: Полное чтение TLS-записи ClientHello (для поддержки больших Kyber-пакетов).
 
-        if not header or len(header) < 5 or header[0] != 0x16:
+        Возвращает всё, что клиент прислал первым. Если клиент ничего не
+        прислал за HELLO_TIMEOUT (протоколы, где первым говорит сервер),
+        возвращает b"" - тогда соединение просто проксируется как есть.
+        """
+        try:
+            # readexactly, а не read(5): read может вернуть меньше 5 байт.
+            header = await asyncio.wait_for(
+                reader.readexactly(5), timeout=HELLO_TIMEOUT
+            )
+        except asyncio.IncompleteReadError as e:
+            return e.partial
+        except asyncio.TimeoutError:
+            return b""
+
+        if header[0] != 0x16:
             return header
 
         record_len = struct.unpack("!H", header[3:5])[0]
 
-        body = bytearray()
+        # Запись TLS не бывает длиннее 16 КБ (+ запас на расширения).
+        if record_len == 0 or record_len > 16384 + 2048:
+            return header
 
-        while len(body) < record_len:
-            chunk = await asyncio.wait_for(
-                reader.read(record_len - len(body)), timeout=10.0
+        try:
+            body = await asyncio.wait_for(
+                reader.readexactly(record_len), timeout=HELLO_TIMEOUT
             )
+        except asyncio.IncompleteReadError as e:
+            body = e.partial
+        except asyncio.TimeoutError:
+            body = b""
 
-            if not chunk:
-                break
+        return header + body
 
-            body.extend(chunk)
+    async def open_remote(self, host: str, port: int):
+        return await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10.0
+        )
 
-        return header + bytes(body)
+    async def connect_with_autodetect(
+        self,
+        host: str,
+        port: int,
+        domain: str,
+        ch_data: bytes,
+        sni_pos: int,
+        sni_len: int,
+        remote_reader: asyncio.StreamReader,
+        remote_writer: asyncio.StreamWriter,
+        client_writer: asyncio.StreamWriter,
+    ):
+        """Режим автоопределения.
+
+        Сначала отправляем ClientHello как есть. Если в ответ сервер не
+        прислал ни байта (DPI сбросил соединение или молча отбросил пакеты),
+        запоминаем домен и тут же повторяем подключение с фрагментацией -
+        браузеру ничего перезапрашивать не нужно.
+
+        Возвращает актуальную пару (reader, writer) для дальнейшего проксирования.
+        """
+        first = b""
+
+        try:
+            remote_writer.write(ch_data)
+            await remote_writer.drain()
+
+            first = await asyncio.wait_for(
+                remote_reader.read(16384), timeout=AUTODETECT_TIMEOUT
+            )
+        except (asyncio.TimeoutError, OSError):
+            first = b""
+
+        if first:
+            client_writer.write(first)
+            await client_writer.drain()
+            return remote_reader, remote_writer
+
+        self.autodetected.add(domain.lower())
+        self.log(f"[Auto] Блокировка обнаружена: {domain}, повтор с обходом DPI")
+
+        try:
+            remote_writer.close()
+        except Exception:
+            pass
+
+        new_reader, new_writer = await self.open_remote(host, port)
+        await self.send_fragmented_tls(new_writer, ch_data, sni_pos, sni_len)
+
+        return new_reader, new_writer
 
     async def send_fragmented_tls(
         self,
@@ -289,9 +371,12 @@ class NoDPIEngine:
                 else:
                     host, port = target, 443
 
+                # IPv6-адрес приходит в скобках: [2001:db8::1]:443
+                host = host.strip("[]")
+
                 try:
-                    remote_reader, remote_writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port), timeout=10.0
+                    remote_reader, remote_writer = await self.open_remote(
+                        host, port
                     )
                 except Exception:
                     if self.mode == "autodetect":
@@ -316,12 +401,30 @@ class NoDPIEngine:
                 if ch_data:
                     sni, sni_pos = self.extract_sni(ch_data)
                     check_domain = sni or host
+                    is_tls = sni_pos > 0
 
-                    if sni_pos > 0 and self.is_target_domain(check_domain):
+                    if is_tls and self.is_target_domain(check_domain):
                         self.log(f"[DPI Bypass] {check_domain}")
 
                         await self.send_fragmented_tls(
                             remote_writer, ch_data, sni_pos, len(sni)
+                        )
+                    elif is_tls and self.mode == "autodetect":
+                        # Домен ещё не известен как заблокированный: пробуем
+                        # без обхода, при сбое сами повторяем с обходом.
+                        (
+                            remote_reader,
+                            remote_writer,
+                        ) = await self.connect_with_autodetect(
+                            host,
+                            port,
+                            check_domain,
+                            ch_data,
+                            sni_pos,
+                            len(sni),
+                            remote_reader,
+                            remote_writer,
+                            client_writer,
                         )
                     else:
                         remote_writer.write(ch_data)
@@ -354,8 +457,8 @@ class NoDPIEngine:
                     client_writer.close()
                     return
 
-                remote_reader, remote_writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=10.0
+                remote_reader, remote_writer = await self.open_remote(
+                    host, port
                 )
 
                 remote_writer.write(first_line + bytes(headers) + b"\r\n")
@@ -392,33 +495,80 @@ class NoDPIEngine:
         )
         self.log(f"Метод: {mode_label} | Режим: {self.mode}")
 
-        async with self.server:
+        # Без "async with": при выходе он вызывает wait_closed(), который
+        # (Python 3.12+) ждёт закрытия ВСЕХ активных соединений и подвисает.
+        try:
             await self.server.serve_forever()
+        finally:
+            self.server.close()
 
     def start_in_thread(self):
         self.running = True
 
         def target():
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+            loop = asyncio.new_event_loop()
+            self.loop = loop
+            asyncio.set_event_loop(loop)
 
             try:
-                self.loop.run_until_complete(self._run_server())
+                self._main_task = loop.create_task(self._run_server())
+
+                # stop() мог быть вызван, пока поток ещё стартовал.
+                if not self.running:
+                    self._main_task.cancel()
+
+                loop.run_until_complete(self._main_task)
+            except asyncio.CancelledError:
+                pass  # штатная остановка через stop()
             except Exception as e:
                 if self.running:
                     self.log(f"Ошибка: {e}")
+            finally:
+                # Закрываем все ещё открытые соединения, чтобы не оставлять
+                # висящие задачи ("Task was destroyed but it is pending").
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+
+                    # Даём транспортам обработать connection_lost до закрытия цикла.
+                    loop.run_until_complete(asyncio.sleep(0.05))
+                except Exception:
+                    pass
+
+                loop.close()
+
+                # Сервер остановился сам (например, порт занят) - сообщаем UI.
+                died_on_its_own = self.running
+                self.running = False
+
+                if died_on_its_own and self.stopped_cb:
+                    try:
+                        self.stopped_cb()
+                    except Exception:
+                        pass
 
         t = threading.Thread(target=target, daemon=True)
         t.start()
 
     def stop(self):
+        was_running = self.running
         self.running = False
 
-        if self.loop and self.server:
-            self.loop.call_soon_threadsafe(self.server.close)
-            self.loop.call_soon_threadsafe(self.loop.stop)
+        loop, task = self.loop, self._main_task
 
-        self.log("Прокси остановлен.")
+        if loop and task and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # цикл уже закрыт
+
+        if was_running:
+            self.log("Прокси остановлен.")
 
 
 # =====================================================================
@@ -426,9 +576,119 @@ class NoDPIEngine:
 # =====================================================================
 
 
+class AndroidVpn:
+    """Запуск/остановка Java-сервиса NoDpiVpnService (см. java_src/).
+
+    Сервис ничего не маршрутизирует, а только выставляет системный HTTP-прокси
+    на локальный адрес NoDPI - это нужно для работы в мобильной сети (LTE),
+    где прокси нельзя задать в настройках Wi-Fi.
+
+    Все обращения к Android API импортируются лениво и обёрнуты в try/except:
+    на ПК (и при любой ошибке) приложение продолжает работать как обычный прокси.
+    """
+
+    REQUEST_CODE = 0x4E44
+    RESULT_OK = -1  # android.app.Activity.RESULT_OK
+    SERVICE_CLASS = "org.gvcoder.nodpi.NoDpiVpnService"
+
+    def __init__(self, log_cb):
+        self.log = log_cb
+        self._pending = None
+
+    @staticmethod
+    def available():
+        return platform == "android"
+
+    def start(self, host, port):
+        if not self.available():
+            return
+
+        try:
+            from android import activity
+            from jnius import autoclass
+
+            activity_cls = autoclass("org.kivy.android.PythonActivity")
+            vpn_service = autoclass("android.net.VpnService")
+            current = activity_cls.mActivity
+
+            self._pending = (host, port)
+
+            # Если разрешение на VPN ещё не выдано - система покажет диалог.
+            prepare_intent = vpn_service.prepare(current)
+
+            if prepare_intent is None:
+                self._launch(host, port)
+            else:
+                activity.bind(on_activity_result=self._on_activity_result)
+                current.startActivityForResult(
+                    prepare_intent, self.REQUEST_CODE
+                )
+        except Exception as e:
+            self.log(f"VPN: не удалось запустить ({e})")
+
+    def stop(self):
+        if not self.available():
+            return
+
+        self._pending = None
+
+        try:
+            from jnius import autoclass
+
+            activity_cls = autoclass("org.kivy.android.PythonActivity")
+            intent_cls = autoclass("android.content.Intent")
+            current = activity_cls.mActivity
+
+            intent = intent_cls()
+            intent.setClassName(current.getPackageName(), self.SERVICE_CLASS)
+            intent.setAction("STOP")
+            current.startService(intent)
+        except Exception as e:
+            self.log(f"VPN: не удалось остановить ({e})")
+
+    def _on_activity_result(self, request_code, result_code, intent):
+        if request_code != self.REQUEST_CODE:
+            return
+
+        try:
+            from android import activity
+
+            activity.unbind(on_activity_result=self._on_activity_result)
+        except Exception:
+            pass
+
+        pending, self._pending = self._pending, None
+
+        if result_code == self.RESULT_OK and pending:
+            self._launch(*pending)
+        else:
+            self.log("VPN: разрешение не выдано, системный прокси не включён")
+
+    def _launch(self, host, port):
+        try:
+            from jnius import autoclass
+
+            activity_cls = autoclass("org.kivy.android.PythonActivity")
+            intent_cls = autoclass("android.content.Intent")
+            current = activity_cls.mActivity
+
+            intent = intent_cls()
+            intent.setClassName(current.getPackageName(), self.SERVICE_CLASS)
+            # Строки, а не int: не зависим от выбора перегрузки putExtra.
+            intent.putExtra("HOST", str(host))
+            intent.putExtra("PORT", str(port))
+            current.startService(intent)
+
+            self.log(f"VPN: системный прокси {host}:{port} включён")
+        except Exception as e:
+            self.log(f"VPN: не удалось запустить сервис ({e})")
+
+
 class NoDPIApp(App):
     def build(self):
         self.engine = None
+        self.vpn = AndroidVpn(self.append_log)
+        self.vpn_active = False
         root = BoxLayout(
             orientation="vertical", padding=dp(16), spacing=dp(10)
         )
@@ -470,6 +730,21 @@ class NoDPIApp(App):
         dis_box.add_widget(self.no_disorder_switch)
 
         root.add_widget(dis_box)
+
+        # Системный прокси через VPN-сервис (для LTE). Только на Android.
+        vpn_box = BoxLayout(size_hint_y=None, height=dp(40))
+        vpn_box.add_widget(
+            Label(text="Системный прокси через VPN (LTE):", size_hint_x=0.75)
+        )
+
+        self.vpn_switch = Switch(
+            active=False,
+            size_hint_x=0.25,
+            disabled=not AndroidVpn.available(),
+        )
+        vpn_box.add_widget(self.vpn_switch)
+
+        root.add_widget(vpn_box)
 
         # Режим фильтрации
         mode_box = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(10))
@@ -554,35 +829,98 @@ class NoDPIApp(App):
 
         Clock.schedule_once(_update, 0)
 
-    def toggle_proxy(self, instance):
-        if self.engine and self.engine.running:
+    def _set_idle_ui(self):
+        self.btn_toggle.text = "ЗАПУСТИТЬ ПРОКСИ"
+        self.btn_toggle.background_color = (0.18, 0.65, 0.32, 1)
+
+    def _set_running_ui(self):
+        self.btn_toggle.text = "ОСТАНОВИТЬ ПРОКСИ"
+        self.btn_toggle.background_color = (0.8, 0.22, 0.22, 1)
+
+    def _read_port(self):
+        raw = self.port_input.text.strip() or "8881"
+
+        try:
+            port = int(raw)
+        except ValueError:
+            port = 0
+
+        if not 1 <= port <= 65535:
+            self.append_log("Ошибка: порт должен быть числом от 1 до 65535")
+            return None
+
+        return port
+
+    def _on_engine_stopped(self):
+        """Прокси остановился сам (например, порт занят). Вызывается из потока."""
+
+        def _reset(dt):
+            if self.vpn_active:
+                self.vpn.stop()
+                self.vpn_active = False
+
+            self.engine = None
+            self._set_idle_ui()
+
+        Clock.schedule_once(_reset, 0)
+
+    def stop_proxy(self):
+        if self.vpn_active:
+            self.vpn.stop()
+            self.vpn_active = False
+
+        if self.engine:
             self.engine.stop()
             self.engine = None
 
-            self.btn_toggle.text = "ЗАПУСТИТЬ ПРОКСИ"
-            self.btn_toggle.background_color = (0.18, 0.65, 0.32, 1)
-        else:
-            mode_map = {
-                "Все сайты (All)": "all",
-                "Чёрный список (Blacklist)": "blacklist",
-                "Автоопределение (Auto)": "autodetect",
-            }
+        self._set_idle_ui()
 
-            domains = self.domains_input.text.splitlines()
+    def toggle_proxy(self, instance):
+        if self.engine and self.engine.running:
+            self.stop_proxy()
+            return
 
-            self.engine = NoDPIEngine(
-                host=self.host_input.text.strip(),
-                port=int(self.port_input.text.strip() or 8881),
-                no_disorder=self.no_disorder_switch.active,
-                mode=mode_map.get(self.mode_spinner.text, "all"),
-                domains=domains,
-                log_cb=self.append_log,
-            )
+        port = self._read_port()
 
-            self.engine.start_in_thread()
+        if port is None:
+            return
 
-            self.btn_toggle.text = "ОСТАНОВИТЬ ПРОКСИ"
-            self.btn_toggle.background_color = (0.8, 0.22, 0.22, 1)
+        mode_map = {
+            "Все сайты (All)": "all",
+            "Чёрный список (Blacklist)": "blacklist",
+            "Автоопределение (Auto)": "autodetect",
+        }
+
+        host = self.host_input.text.strip() or "127.0.0.1"
+        domains = self.domains_input.text.splitlines()
+
+        self.engine = NoDPIEngine(
+            host=host,
+            port=port,
+            no_disorder=self.no_disorder_switch.active,
+            mode=mode_map.get(self.mode_spinner.text, "all"),
+            domains=domains,
+            log_cb=self.append_log,
+            stopped_cb=self._on_engine_stopped,
+        )
+
+        self.engine.start_in_thread()
+        self._set_running_ui()
+
+        if self.vpn_switch.active and AndroidVpn.available():
+            # Системный прокси всегда указывает на локальный адрес.
+            self.vpn.start("127.0.0.1", port)
+            self.vpn_active = True
+
+    def on_pause(self):
+        # Разрешаем уходить в фон, а не останавливать приложение (Android).
+        return True
+
+    def on_resume(self):
+        pass
+
+    def on_stop(self):
+        self.stop_proxy()
 
 
 if __name__ == "__main__":
