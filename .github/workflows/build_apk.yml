@@ -21,8 +21,8 @@ jobs:
 
       # Ключ зависит от buildozer.spec и хука: при смене версий p4a/Python/NDK
       # кэш пересоздаётся, а не подмешивает устаревшие сборки.
-      - name: Cache Buildozer directories
-        uses: actions/cache@v4
+      - name: Restore Buildozer cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             .buildozer
@@ -90,6 +90,10 @@ jobs:
           echo "::error title=Failed command::$(cat part2.txt)"
           head -n "$END" clean.log | grep -n -E '(^|[^a-zA-Z_])(ERROR|Error:|error:|FAILED|Exception|Traceback|not found|No such file|cannot find)' | grep -v -E 'Compiling |/Lib/test/' | tail -n 20 | enc > part3.txt
           echo "::error title=Error lines::$(cat part3.txt)"
+          grep -n -m1 -E 'What went wrong|FAILURE: Build failed|Execution failed' clean.log || true
+          G=$(grep -n -m1 -E 'FAILURE: Build failed|What went wrong' clean.log | cut -d: -f1)
+          if [ -n "$G" ]; then sed -n "$((G-25)),$((G+30))p" clean.log | enc > part4.txt; else grep -n -E '\.java:[0-9]+: error|Could not|Unsupported|Duplicate|AAPT|Execution failed' clean.log | tail -n 20 | enc > part4.txt; fi
+          echo "::error title=Gradle error::$(cat part4.txt)"
 
       - name: Show built APK
         run: ls -lh bin/*.apk
@@ -100,3 +104,13 @@ jobs:
           name: NoDPI-v2.3-LTE-APK
           path: bin/*.apk
           if-no-files-found: error
+
+      # Кэш сохраняем и при падении сборки, чтобы повторные прогоны были быстрыми.
+      - name: Save Buildozer cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .buildozer
+            ~/.buildozer
+          key: buildozer-v4-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'p4a_hook.py') }}
