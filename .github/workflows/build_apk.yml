@@ -24,7 +24,7 @@ jobs:
       # Gradle 8 / Android Gradle Plugin требуют Java 17, а на раннере по
       # умолчанию JAVA_HOME указывает на Java 11 (установка openjdk-17 это не меняет).
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
