@@ -32,16 +32,29 @@ HELLO_TIMEOUT = 5.0
 # Если за это время пришёл RST/EOF/тишина - считаем, что домен блокируется DPI.
 AUTODETECT_TIMEOUT = 4.0
 
-# DNS-over-HTTPS: провайдеры часто подменяют DNS-ответы для заблокированных
-# доменов (YouTube и др.), поэтому имена разрешаем сами. К серверам идём по IP,
-# чтобы не зависеть от DNS. Формат: (ip, имя для SNI/Host, путь, порт).
+# Разрешение имён. Провайдеры подменяют/блокируют DNS-ответы для заблокированных
+# доменов (YouTube и др.), поэтому имена разрешаем сами, по порядку:
+#   1) DNS-over-HTTPS по IP-адресу БЕЗ SNI (DPI часто режет SNI cloudflare-dns.com
+#      и dns.google; сертификат проверяется по IP). Все серверы - параллельно.
+#   2) Обычный DNS по UDP на публичные серверы (в т.ч. Яндекс).
+#   3) Системный DNS.
+# Формат DoH: (ip, Host, путь, порт, имя для проверки сертификата).
 DOH_PROVIDERS = [
-    ("1.1.1.1", "cloudflare-dns.com", "/dns-query", 443),
-    ("8.8.8.8", "dns.google", "/resolve", 443),
-    ("1.0.0.1", "cloudflare-dns.com", "/dns-query", 443),
-    ("8.8.4.4", "dns.google", "/resolve", 443),
+    ("1.1.1.1", "cloudflare-dns.com", "/dns-query", 443, "1.1.1.1"),
+    ("1.0.0.1", "cloudflare-dns.com", "/dns-query", 443, "1.0.0.1"),
+    ("8.8.8.8", "dns.google", "/resolve", 443, "8.8.8.8"),
+    ("8.8.4.4", "dns.google", "/resolve", 443, "8.8.4.4"),
 ]
-DOH_TIMEOUT = 4.0
+UDP_DNS_SERVERS = [
+    ("77.88.8.8", 53),
+    ("8.8.8.8", 53),
+    ("1.1.1.1", 53),
+    ("9.9.9.9", 53),
+]
+DOH_TIMEOUT = 3.5
+UDP_TIMEOUT = 2.5
+# Если способ целиком не ответил, не пробуем его столько секунд.
+STAGE_DEAD_SECONDS = 120
 
 
 # =====================================================================
@@ -71,6 +84,9 @@ class NoDPIEngine:
         self.autodetected = set()
         self.use_doh = use_doh
         self.doh_providers = list(DOH_PROVIDERS)
+        self.udp_servers = list(UDP_DNS_SERVERS)
+        self._stage_dead = {}  # способ -> до какого времени не пробовать
+        self._stage_ok_logged = set()
         self._dns_cache = {}  # host -> (expires_at, [ip, ...])
         self._dns_logged = set()
         self._ssl_ctx = None
@@ -248,16 +264,16 @@ class NoDPIEngine:
 
     async def _doh_query(self, provider, name: str):
         """Один DoH-запрос (JSON API). Возвращает ([ip, ...], ttl)."""
-        ip, sni, path, port = provider
+        ip, host_header, path, port, tls_name = provider
 
         reader, writer = await asyncio.open_connection(
-            ip, port, ssl=self._ssl_context(), server_hostname=sni
+            ip, port, ssl=self._ssl_context(), server_hostname=tls_name
         )
 
         try:
             request = (
                 f"GET {path}?name={name}&type=A HTTP/1.1\r\n"
-                f"Host: {sni}\r\n"
+                f"Host: {host_header}\r\n"
                 "Accept: application/dns-json\r\n"
                 "Connection: close\r\n\r\n"
             )
@@ -284,12 +300,150 @@ class NoDPIEngine:
         for ans in data.get("Answer", []):
             if ans.get("type") == 1:
                 ips.append(ans["data"])
-                ttl = min(ttl, int(ans.get("TTL", 300))) if ttl else 300
+                ttl = min(ttl, int(ans.get("TTL", 300)))
 
         return ips, max(ttl, 60)
 
+    # --- обычный DNS по UDP -------------------------------------------
+
+    @staticmethod
+    def _dns_build(name: str):
+        tid = random.randint(0, 65535)
+        labels = name.rstrip(".").encode("idna").split(b".")
+        qname = b"".join(bytes([len(x)]) + x for x in labels) + b"\x00"
+        packet = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+        return tid, packet + qname + struct.pack("!HH", 1, 1)
+
+    @staticmethod
+    def _dns_parse(data: bytes, tid: int):
+        """Разбор ответа на A-запрос. ValueError - чужой/битый пакет."""
+        if len(data) < 12:
+            raise ValueError("short")
+
+        rid, flags, qd, an, _, _ = struct.unpack("!HHHHHH", data[:12])
+
+        if rid != tid or not flags & 0x8000:
+            raise ValueError("not our response")
+
+        if flags & 0xF:  # NXDOMAIN, SERVFAIL...: ответ есть, адресов нет
+            return [], 300
+
+        def skip_name(pos):
+            while True:
+                length = data[pos]
+                if length == 0:
+                    return pos + 1
+                if length & 0xC0 == 0xC0:
+                    return pos + 2
+                pos += 1 + length
+
+        try:
+            pos = 12
+            for _ in range(qd):
+                pos = skip_name(pos) + 4
+
+            ips, ttl = [], 300
+
+            for _ in range(an):
+                pos = skip_name(pos)
+                rtype, rclass, rttl, rdlen = struct.unpack(
+                    "!HHIH", data[pos : pos + 10]
+                )
+                pos += 10
+
+                if rtype == 1 and rclass == 1 and rdlen == 4:
+                    ips.append(socket.inet_ntoa(data[pos : pos + 4]))
+                    ttl = min(ttl, rttl)
+
+                pos += rdlen
+        except (IndexError, struct.error):
+            raise ValueError("malformed")
+
+        return ips, max(ttl, 60)
+
+    async def _udp_query(self, server, name: str):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        tid, packet = self._dns_build(name)
+        parse = self._dns_parse
+
+        class Proto(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                self.transport = transport
+                transport.sendto(packet)
+                # UDP теряется - повторяем один раз через секунду.
+                self.retry = loop.call_later(1.0, lambda: transport.sendto(packet))
+
+            def datagram_received(self, data, addr):
+                if fut.done():
+                    return
+                try:
+                    fut.set_result(parse(data, tid))
+                except ValueError:
+                    pass  # чужой пакет - ждём дальше
+
+            def error_received(self, exc):
+                if not fut.done():
+                    fut.set_exception(exc)
+
+        transport, proto = await loop.create_datagram_endpoint(
+            Proto, remote_addr=server
+        )
+
+        try:
+            return await fut
+        finally:
+            proto.retry.cancel()
+            transport.close()
+
+    # --- выбор способа -----------------------------------------------
+
+    @staticmethod
+    async def _first_answer(coros, timeout: float):
+        """Параллельно запускает запросы, возвращает первый непустой ответ.
+
+        Возвращает (ips, ttl, answered, last_error): answered=True, если хоть
+        один сервер ответил (пусть и пустым ответом), т.е. способ рабочий.
+        """
+        tasks = [asyncio.ensure_future(c) for c in coros]
+        pending = set(tasks)
+        deadline = time.time() + timeout
+        answered, last_err = False, None
+
+        try:
+            while pending:
+                left = deadline - time.time()
+                if left <= 0:
+                    break
+
+                done, pending = await asyncio.wait(
+                    pending, timeout=left, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if not done:
+                    break
+
+                for task in done:
+                    if task.exception() is not None:
+                        last_err = task.exception()
+                        continue
+
+                    answered = True
+                    ips, ttl = task.result()
+
+                    if ips:
+                        return ips, ttl, True, None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        return [], 300, answered, last_err
+
     async def resolve(self, host: str):
-        """Список IPv4-адресов для подключения (через DoH, иначе имя как есть)."""
+        """Список IPv4-адресов для подключения."""
         try:
             ipaddress.ip_address(host)
             return [host]
@@ -305,30 +459,38 @@ class NoDPIEngine:
         if cached and cached[0] > time.time():
             return cached[1]
 
-        last_err = None
+        stages = (
+            ("DoH", DOH_TIMEOUT, lambda: [self._doh_query(p, key) for p in self.doh_providers]),
+            ("UDP DNS", UDP_TIMEOUT, lambda: [self._udp_query(s, key) for s in self.udp_servers]),
+        )
 
-        for provider in self.doh_providers:
-            try:
-                ips, ttl = await asyncio.wait_for(
-                    self._doh_query(provider, key), timeout=DOH_TIMEOUT
-                )
-            except Exception as e:
-                last_err = e
+        for label, timeout, make in stages:
+            if self._stage_dead.get(label, 0) > time.time():
                 continue
+
+            ips, ttl, answered, err = await self._first_answer(make(), timeout)
 
             if ips:
                 self._dns_cache[key] = (time.time() + ttl, ips)
+
+                if label not in self._stage_ok_logged:
+                    self._stage_ok_logged.add(label)
+                    self.log(f"[DNS] {label} работает")
+
                 await self._log_dns_mismatch(key, ips)
                 return ips
 
-        self.log(
-            f"[DNS] DoH не сработал для {host} "
-            f"({type(last_err).__name__ if last_err else 'нет ответа'}), "
-            "использую системный DNS"
-        )
+            if not answered:
+                self._stage_dead[label] = time.time() + STAGE_DEAD_SECONDS
+                self.log(
+                    f"[DNS] {label} недоступен "
+                    f"({type(err).__name__ if err else 'таймаут'}), "
+                    f"пауза {STAGE_DEAD_SECONDS} с"
+                )
+
         return [host]
 
-    async def _log_dns_mismatch(self, host: str, doh_ips):
+    async def _log_dns_mismatch(self, host: str, found_ips):
         """Один раз на домен показываем, если системный DNS отдаёт другое (подмена)."""
         if host in self._dns_logged:
             return
@@ -343,10 +505,10 @@ class NoDPIEngine:
         except Exception as e:
             system_ips = [f"ошибка {type(e).__name__}"]
 
-        if not set(system_ips) & set(doh_ips):
+        if not set(system_ips) & set(found_ips):
             self.log(
-                f"[DNS] {host}: системный DNS={','.join(system_ips)} "
-                f"отличается от DoH={','.join(doh_ips[:3])} - используем DoH"
+                f"[DNS] {host}: системный DNS={','.join(system_ips)}, "
+                f"используем {','.join(found_ips[:3])}"
             )
 
     async def open_remote(self, host: str, port: int):
@@ -914,7 +1076,7 @@ class NoDPIApp(App):
         # DNS через DoH (обход подмены DNS провайдером)
         doh_box = BoxLayout(size_hint_y=None, height=dp(40))
         doh_box.add_widget(
-            Label(text="DNS через DoH (обход подмены DNS):", size_hint_x=0.75)
+            Label(text="Свой DNS (обход подмены):", size_hint_x=0.75)
         )
 
         self.doh_switch = Switch(active=True, size_hint_x=0.25)
