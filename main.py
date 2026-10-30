@@ -2,6 +2,9 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
+import shlex
+import tempfile
 import random
 import socket
 import ssl
@@ -58,6 +61,241 @@ STAGE_DEAD_SECONDS = 120
 
 
 # =====================================================================
+# СТРАТЕГИИ ОБХОДА В ФОРМАТЕ BYEDPI (ciadpi)
+# =====================================================================
+# Приёмы и их семантика перенесены из ByeDPI (https://github.com/hufrea/byedpi,
+# лицензия MIT): split, disorder, oob, disoob, fake, ttl, oob-data, tlsrec,
+# tlsminor. Строку аргументов можно вставить из ByeByeDPI как есть.
+
+# Поддельный ClientHello по умолчанию (tls_data из ByeDPI, 351 байт + нули до 517).
+FAKE_TLS = bytes.fromhex(
+    "1603010200010001fc0303035f6f2ced1322f8dcb2f260482d72666f57dd139d1b37dcfa"
+    "362ebaf992993a20f9df0c2e8a55898231631aefa8be0858a7a35a18d3965f045cb462af"
+    "89d70f8b003e130213031301c02cc030009fcca9cca8ccaac02bc02f009ec024c028006b"
+    "c023c0270067c00ac0140039c009c0130033009d009c003d003c0035002f00ff01000175"
+    "0000001600140000117777772e77696b6970656469612e6f7267000b000403000102000a"
+    "00160014001d0017001e00190018010001010102010301040010000e000c026832086874"
+    "74702f312e31001600000017000000310000000d002a0028040305030603080708080809"
+    "080a080b080408050806040105010601030303010302040205020602002b000908030403"
+    "0303020301002d00020101003300260024001d0020118cb88ce88a08901eee19d9dde8d4"
+    "06b1d1e2abe01663d6dcda84a4b84bfb0e001500ac000000000000"
+) + bytes(517 - 351)
+
+# Стратегия по умолчанию (из ByeByeDPI: disorder + split/tlsrec по SNI + oob + fake).
+DEFAULT_STRATEGY = "-d1 -s1+s -r1+s -e1 -m1 -o1+s -f-1 -t2 -a1"
+
+MODE_SPLIT, MODE_DISORDER, MODE_OOB, MODE_DISOOB, MODE_FAKE = (
+    "split", "disorder", "oob", "disoob", "fake",
+)
+
+_OPT_MODES = {
+    "s": MODE_SPLIT, "split": MODE_SPLIT,
+    "d": MODE_DISORDER, "disorder": MODE_DISORDER,
+    "o": MODE_OOB, "oob": MODE_OOB,
+    "q": MODE_DISOOB, "disoob": MODE_DISOOB,
+    "f": MODE_FAKE, "fake": MODE_FAKE,
+}
+_OPT_TLSREC = ("r", "tlsrec")
+_OPT_WITH_ARG = {
+    "t": "ttl", "ttl": "ttl", "e": "oob-data", "oob-data": "oob-data",
+    "m": "tlsminor", "tlsminor": "tlsminor",
+}
+# Принимаем, но не применяем (на Android без root недоступно или не нужно).
+_OPT_IGNORED_ARG = set("aAbcgiIjKlLMnOpQRTuVwHy") | {
+    "udp-fake", "auto", "buf-size", "max-conn", "def-ttl", "ip", "port",
+    "fake-data", "mod-http", "fake-sni", "fake-offset", "fake-tls-mod",
+    "auto-mode", "cache-ttl", "timeout", "proto", "hosts", "ipset", "round",
+    "conn-ip", "cache-dump", "pf", "pidfile",
+}
+_OPT_IGNORED_FLAG = set("YSNUFDE") | {
+    "drop-sack", "md5sig", "no-domain", "no-udp", "tfo", "daemon", "transparent",
+}
+
+
+class _StopDesync(Exception):
+    pass
+
+
+class Part:
+    """Позиция разбиения: offset[:repeats:skip][+flags]."""
+
+    def __init__(self, mode, spec):
+        self.mode = mode
+        spec = spec.strip()
+        head, _, flags = spec.partition("+")
+        nums = head.split(":")
+        self.pos = int(nums[0] or 0)
+        self.repeats = int(nums[1]) if len(nums) > 1 and nums[1] else 1
+        self.skip = int(nums[2]) if len(nums) > 2 and nums[2] else 0
+        self.sni = "s" in flags
+        self.host = "h" in flags
+        self.end = "e" in flags
+        self.mid = "m" in flags
+        self.rand = "r" in flags
+        self.has_flags = bool(flags)
+
+    @property
+    def uses_host(self):
+        return self.sni or self.host
+
+
+class Strategy:
+    def __init__(self, text=""):
+        self.text = (text or "").strip()
+        self.parts = []
+        self.tlsrec = []
+        self.ttl = 8
+        self.oob_char = b"a"
+        self.tlsminor = None
+        self.ignored = []
+        self.errors = []
+        self._parse()
+
+    def _parse(self):
+        try:
+            tokens = shlex.split(self.text)
+        except ValueError as e:
+            self.errors.append(f"разбор строки: {e}")
+            return
+
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            i += 1
+
+            if not tok.startswith("-") or tok == "-":
+                self.errors.append(f"лишний аргумент {tok}")
+                continue
+
+            if tok.startswith("--"):
+                name, eq, val = tok[2:].partition("=")
+                has_val = bool(eq)
+            else:
+                name, val = tok[1], tok[2:]
+                has_val = bool(val)
+
+            def take():
+                nonlocal i, val, has_val
+                if has_val:
+                    return val
+                if i < len(tokens):
+                    i += 1
+                    return tokens[i - 1]
+                raise ValueError("нет значения у -" + name)
+
+            try:
+                if name in _OPT_MODES:
+                    self.parts.append(Part(_OPT_MODES[name], take()))
+                elif name in _OPT_TLSREC:
+                    self.tlsrec.append(Part(MODE_SPLIT, take()))
+                elif name in _OPT_WITH_ARG:
+                    key, v = _OPT_WITH_ARG[name], take()
+                    if key == "ttl":
+                        self.ttl = int(v)
+                    elif key == "oob-data":
+                        self.oob_char = (
+                            v.encode("latin1", "ignore")[:1] or b"a"
+                        )
+                    elif key == "tlsminor":
+                        self.tlsminor = int(v)
+                elif name in _OPT_IGNORED_ARG:
+                    take()
+                    self.ignored.append("-" + name)
+                elif name in _OPT_IGNORED_FLAG:
+                    self.ignored.append("-" + name)
+                else:
+                    self.ignored.append("-" + name)
+            except ValueError as e:
+                self.errors.append(str(e))
+
+    @property
+    def active(self):
+        return bool(self.parts or self.tlsrec or self.tlsminor is not None)
+
+
+def parse_tls_hello(data: bytes):
+    """(sni_pos, sni_len) для ClientHello; (0, 0) если SNI не найден."""
+    sni, pos = NoDPIEngine.extract_sni(data)
+    return (pos, len(sni)) if sni and pos > 0 else (0, 0)
+
+
+def gen_offset(part, n, lp, host_pos, host_len):
+    """Порт gen_offset из ByeDPI. -1 - позиция не определена."""
+    pos = part.pos
+
+    if part.uses_host:
+        if not host_pos or (part.sni and not host_len):
+            return -1
+        pos += host_pos
+        if part.end:
+            pos += host_len
+        elif part.mid:
+            pos += host_len // 2
+        elif part.rand:
+            pos += random.randrange(max(host_len, 1))
+    elif part.rand:
+        pos += lp + random.randrange(max(n - lp, 1))
+    elif part.mid:
+        pos += n // 2
+    elif pos < 0 or part.end:
+        pos += n
+
+    return pos
+
+
+def part_tls(buf: bytearray, base: int, n: int, pos: int) -> int:
+    """Порт part_tls: делит TLS-запись, начинающуюся с buf[base], на две."""
+    if n < 5 or pos < 0 or pos + 5 > n:
+        return 0
+
+    r_sz = struct.unpack_from("!H", buf, base + 3)[0]
+
+    if r_sz < pos:
+        return 0
+
+    buf[base + 5 + pos : base + 5 + pos] = bytes(buf[base : base + 3]) + b"\x00\x00"
+    struct.pack_into("!H", buf, base + 3, pos)
+    struct.pack_into("!H", buf, base + 5 + pos + 3, r_sz - pos)
+    return 5
+
+
+def apply_tls_tamper(strategy, data: bytes, host_pos: int, host_len: int):
+    """tlsminor и tlsrec из ByeDPI. Возвращает новый bytearray."""
+    buf = bytearray(data)
+    is_hello = len(buf) > 5 and buf[0] == 0x16 and buf[1] == 0x03 and buf[5] == 0x01
+
+    if not is_hello:
+        return buf
+
+    if strategy.tlsminor is not None:
+        buf[2] = strategy.tlsminor & 0xFF
+
+    lp, rc = 0, 0
+
+    for part in strategy.tlsrec:
+        for idx in range(part.repeats):
+            n = len(buf)
+            pos = rc * 5
+            pos += gen_offset(part, n - pos, lp, host_pos, host_len)
+
+            if part.pos < 0 or part.has_flags:
+                pos -= 5
+
+            pos += part.skip * idx
+
+            if pos < lp:
+                return buf
+
+            if not part_tls(buf, lp, n - lp, pos - lp):
+                return buf
+
+            lp = pos + 5
+            rc += 1
+
+    return buf
+
+
+# =====================================================================
 # ЯДРО NODPI v2.3 (Асинхронный прокси с поддержкой Kyber и Disorder)
 # =====================================================================
 
@@ -73,6 +311,7 @@ class NoDPIEngine:
         log_cb=None,
         stopped_cb=None,
         use_doh=True,
+        strategy="",
     ):
         self.host = host
         self.port = int(port)
@@ -83,6 +322,7 @@ class NoDPIEngine:
         )
         self.autodetected = set()
         self.use_doh = use_doh
+        self.strategy = Strategy(strategy)
         self.doh_providers = list(DOH_PROVIDERS)
         self.udp_servers = list(UDP_DNS_SERVERS)
         self._stage_dead = {}  # способ -> до какого времени не пробовать
@@ -583,7 +823,19 @@ class NoDPIEngine:
         sni_pos: int,
         sni_len: int,
     ):
-        """Фича v2.3: Фрагментация ClientHello с режимом disorder (или без него при --no-disorder)."""
+        """Отправка ClientHello с обходом DPI.
+
+        Если задана стратегия ByeDPI - применяем её (send_desync), иначе старая
+        фрагментация v2.3 с режимом disorder (или без него при --no-disorder).
+        """
+        if self.strategy.active and sni_pos > 0:
+            try:
+                await self.send_desync(writer, data, sni_pos, sni_len)
+                return
+            except Exception as e:
+                self.log(f"[Стратегия] ошибка {type(e).__name__}: {e}")
+                raise
+
         sock = writer.get_extra_info("socket")
 
         if sock:
@@ -633,6 +885,183 @@ class NoDPIEngine:
                     writer.write(part)
                     await writer.drain()
                     await asyncio.sleep(0.005)
+
+    # ---------------------------------------------------------------
+    # Стратегия ByeDPI: split / disorder / oob / disoob / fake
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def _set_ttl(sock, ttl: int):
+        ok = False
+        for level, opt in (
+            (socket.IPPROTO_IP, socket.IP_TTL),
+            (socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS),
+        ):
+            try:
+                sock.setsockopt(level, opt, ttl)
+                ok = True
+            except OSError:
+                pass
+        return ok
+
+    @staticmethod
+    def _get_ttl(sock) -> int:
+        try:
+            return sock.getsockopt(socket.IPPROTO_IP, socket.IP_TTL)
+        except OSError:
+            return 64
+
+    @staticmethod
+    def _notsent_bytes(sock) -> int:
+        """tcpi_notsent_bytes из TCP_INFO (смещение 144 в struct tcp_info)."""
+        try:
+            info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+
+            if len(info) >= 148:
+                value = struct.unpack_from("I", info, 144)[0]
+                return value if value < (1 << 24) else 0
+        except (OSError, AttributeError):
+            pass
+        return 0
+
+    async def _wait_sent(self, sock):
+        """Ждём, пока ядро реально отправит данные (как sock_has_notsent в ByeDPI)."""
+        for _ in range(60):
+            if self._notsent_bytes(sock) == 0:
+                break
+            await asyncio.sleep(0.005)
+
+    @staticmethod
+    async def _raw_send(sock, data: bytes, flags: int = 0):
+        sent = 0
+
+        while sent < len(data):
+            try:
+                sent += sock.send(data[sent:], flags)
+            except (BlockingIOError, InterruptedError):
+                await asyncio.sleep(0.005)
+
+        return sent
+
+    @staticmethod
+    def _make_fake_file(content: bytes):
+        """Файл в памяти (или временный), из которого шлём фейк через sendfile.
+
+        Страницы остаются в странице-кэше ядра и используются при повторной
+        отправке сегмента, поэтому позднее их можно подменить настоящими данными.
+        """
+        try:
+            fd = os.memfd_create("nodpi")
+            path = None
+        except (AttributeError, OSError):
+            fd, path = tempfile.mkstemp(prefix="nodpi_")
+        os.write(fd, content)
+        return fd, path
+
+    async def _send_fake(self, sock, real: bytes, ttl: int):
+        """Отправляет поддельные данные с малым TTL, потом подменяет их настоящими.
+
+        Фейк доходит до DPI, но не до сервера. Сервер не подтверждает этот кусок,
+        ядро отправляет его заново - уже с настоящими данными.
+        """
+        length = len(real)
+        fake = (FAKE_TLS + bytes(max(0, length - len(FAKE_TLS))))[:length]
+        fd, path = self._make_fake_file(fake)
+
+        try:
+            if not self._set_ttl(sock, ttl):
+                raise OSError("не удалось выставить TTL")
+
+            sent = 0
+            while sent < length:
+                try:
+                    sent += os.sendfile(sock.fileno(), fd, sent, length - sent)
+                except (BlockingIOError, InterruptedError):
+                    await asyncio.sleep(0.005)
+
+            # Фейк должен реально уйти в сеть до того, как мы его подменим.
+            await self._wait_sent(sock)
+            await asyncio.sleep(0.01)
+            os.pwrite(fd, real, 0)
+        finally:
+            os.close(fd)
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+        return length
+
+    async def send_desync(
+        self, writer, data: bytes, sni_pos: int, sni_len: int
+    ):
+        """Порт desync() из ByeDPI для первого запроса (ClientHello)."""
+        st = self.strategy
+        tsock = writer.get_extra_info("socket")
+        sock = socket.socket(fileno=os.dup(tsock.fileno()))
+        buf = bytearray(data)
+        lp = 0
+        def_ttl = 64
+
+        try:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+
+            def_ttl = self._get_ttl(sock)
+            buf = apply_tls_tamper(st, data, sni_pos, sni_len)
+            n = len(buf)
+
+            for part in st.parts:
+                for idx in range(part.repeats):
+                    pos = gen_offset(part, n, lp, sni_pos, sni_len)
+                    pos += part.skip * idx
+
+                    if pos < 0 or pos < lp:
+                        self.log(
+                            f"[Стратегия] split отменён: pos={pos}, lp={lp}, n={n}"
+                        )
+                        raise _StopDesync
+
+                    pos = min(pos, n)
+                    chunk = bytes(buf[lp:pos])
+
+                    if part.mode == MODE_FAKE:
+                        if pos != lp:
+                            await self._send_fake(sock, chunk, st.ttl)
+                    elif part.mode == MODE_OOB:
+                        await self._raw_send(
+                            sock, chunk + st.oob_char, socket.MSG_OOB
+                        )
+                    elif part.mode in (MODE_DISORDER, MODE_DISOOB):
+                        # Чётные части уходят с TTL=1 и теряются: ядро отправит их
+                        # позже, нарушив порядок сегментов.
+                        if idx % 2 == 0:
+                            self._set_ttl(sock, 1)
+                        if part.mode == MODE_DISOOB:
+                            await self._raw_send(
+                                sock, chunk + st.oob_char, socket.MSG_OOB
+                            )
+                        else:
+                            await self._raw_send(sock, chunk)
+                    else:
+                        await self._raw_send(sock, chunk)
+
+                    await self._wait_sent(sock)
+                    self._set_ttl(sock, def_ttl)
+                    await asyncio.sleep(0.002)
+                    lp = pos
+
+            if lp < n:
+                await self._raw_send(sock, bytes(buf[lp:n]))
+        except _StopDesync:
+            # как в ByeDPI: при отмене разбиения отправляем остаток как есть
+            self._set_ttl(sock, def_ttl)
+            await self._raw_send(sock, bytes(buf[lp:]))
+        finally:
+            sock.close()
 
     async def pipe(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -833,9 +1262,18 @@ class NoDPIEngine:
         self.log(f"Прокси запущен на {self.host}:{self.port}")
 
         mode_label = (
-            "Disorder (v2.3)" if not self.no_disorder else "Standard (--no-disorder)"
+            "ByeDPI-стратегия" if self.strategy.active
+            else "Disorder (v2.3)" if not self.no_disorder
+            else "Standard (--no-disorder)"
         )
         self.log(f"Метод: {mode_label} | Режим: {self.mode}")
+
+        if self.strategy.active:
+            self.log(f"Стратегия: {self.strategy.text}")
+            if self.strategy.errors:
+                self.log("Стратегия: ошибки: " + "; ".join(self.strategy.errors))
+        elif self.strategy.text:
+            self.log("Стратегия не распознана, используется простая фрагментация")
 
         # Без "async with": при выходе он вызывает wait_closed(), который
         # (Python 3.12+) ждёт закрытия ВСЕХ активных соединений и подвисает.
@@ -1084,6 +1522,23 @@ class NoDPIApp(App):
 
         root.add_widget(doh_box)
 
+        # Стратегия обхода в формате ByeDPI (можно вставить из ByeByeDPI).
+        root.add_widget(
+            Label(
+                text="Стратегия (аргументы ByeDPI, пусто = простая):",
+                size_hint_y=None,
+                height=dp(24),
+            )
+        )
+
+        self.strategy_input = TextInput(
+            text=DEFAULT_STRATEGY,
+            multiline=False,
+            size_hint_y=None,
+            height=dp(40),
+        )
+        root.add_widget(self.strategy_input)
+
         # Системный прокси через VPN-сервис (для LTE). Только на Android.
         vpn_box = BoxLayout(size_hint_y=None, height=dp(40))
         vpn_box.add_widget(
@@ -1256,6 +1711,7 @@ class NoDPIApp(App):
             log_cb=self.append_log,
             stopped_cb=self._on_engine_stopped,
             use_doh=self.doh_switch.active,
+            strategy=self.strategy_input.text,
         )
 
         self.engine.start_in_thread()

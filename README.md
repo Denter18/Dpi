@@ -17,6 +17,15 @@ TLS ClientHello (режим Disorder) по границе SNI.
    «Системный прокси через VPN» — `NoDpiVpnService` выставит системный HTTP-прокси
    (трафик через VPN не гонится, Android 10+).
 
+## Стратегия обхода (формат ByeDPI)
+
+В поле «Стратегия» можно вставить аргументы из ByeByeDPI (Настройки → Аргументы командной
+строки). Поддерживаются `-s/--split`, `-d/--disorder`, `-o/--oob`, `-q/--disoob`,
+`-f/--fake`, `-t/--ttl`, `-e/--oob-data`, `-r/--tlsrec`, `-m/--tlsminor` с позициями
+вида `1+s`, `-1`, `1:3:5`. Остальные аргументы принимаются и игнорируются. Пустое поле —
+простая фрагментация SNI. По умолчанию: `-d1 -s1+s -r1+s -e1 -m1 -o1+s -f-1 -t2 -a1`.
+Приёмы перенесены из [ByeDPI](https://github.com/hufrea/byedpi) (MIT).
+
 ## Сборка
 
 APK собирается GitHub Actions (`.github/workflows/build_apk.yml`) при пуше в `main`/`master`
