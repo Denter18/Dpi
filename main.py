@@ -836,55 +836,59 @@ class NoDPIEngine:
                 self.log(f"[Стратегия] ошибка {type(e).__name__}: {e}")
                 raise
 
-        sock = writer.get_extra_info("socket")
-
-        if sock:
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
-
-        if sni_pos <= 0:
+        if sni_pos <= 5:
             writer.write(data)
             await writer.drain()
             return
 
-        mid = sni_pos + max(1, sni_len // 2)
+        # Точный порт метода NoDPI v2.3 (GVCoder09/NoDPI, src/main.py):
+        # ClientHello режется на отдельные TLS-записи - часть до SNI, SNI по
+        # 2 символа, часть после SNI; у каждой свой заголовок 16 03 04.
+        payload = data[5:]
+        start = sni_pos - 5
+        end = start + sni_len
 
-        if self.no_disorder:
-            # Базовая фрагментация ровно посередине SNI (--no-disorder)
-            parts = [data[:mid], data[mid:]]
+        def record(chunk: bytes) -> bytes:
+            return b"\x16\x03\x04" + len(chunk).to_bytes(2, "big") + chunk
 
-            for part in parts:
-                writer.write(part)
-                await writer.drain()
-                await asyncio.sleep(0.002)
+        parts = [record(payload[:start])]
+
+        for i in range(0, sni_len, 2):
+            parts.append(record(payload[start + i : start + min(i + 2, sni_len)]))
+
+        parts.append(record(payload[end:]))
+
+        if not self.no_disorder and len(parts) > 2:
+            await self._send_disorder_v23(
+                writer, parts[0] + parts[1], b"".join(parts[2:])
+            )
         else:
-            # Режим Disorder (по умолчанию в v2.3): нарезка заголовка, SNI по кускам и отправка с принудительным сбросом буфера.
-            parts = []
+            writer.write(b"".join(parts))
+            await writer.drain()
 
-            if sni_pos > 5:
-                parts.append(data[:5])
-                parts.append(data[5:sni_pos])
-            else:
-                parts.append(data[:sni_pos])
+    async def _send_disorder_v23(self, writer, first: bytes, rest: bytes):
+        """Первый кусок уходит с TTL=1 и теряется, остальное - сразу; потерянный
+        кусок ядро досылает позже с обычным TTL, поэтому DPI видит поток не по порядку."""
+        sock = writer.get_extra_info("socket")
 
-            # Дробим сам SNI на мелкие фрагменты по 1-3 байта
-            idx = sni_pos
-            sni_end = sni_pos + sni_len
+        if sock.family == socket.AF_INET6:
+            level, option = socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS
+        else:
+            level, option = socket.IPPROTO_IP, socket.IP_TTL
 
-            while idx < sni_end:
-                step = random.randint(1, 3)
-                parts.append(data[idx : min(idx + step, sni_end)])
-                idx += step
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        default_ttl = sock.getsockopt(level, option)
+        sock.setsockopt(level, option, 1)
 
-            parts.append(data[sni_end:])
+        try:
+            writer.write(first)
+            await writer.drain()
+            await asyncio.sleep(0.01)
+        finally:
+            sock.setsockopt(level, option, default_ttl)
 
-            for part in parts:
-                if part:
-                    writer.write(part)
-                    await writer.drain()
-                    await asyncio.sleep(0.005)
+        writer.write(rest)
+        await writer.drain()
 
     # ---------------------------------------------------------------
     # Стратегия ByeDPI: split / disorder / oob / disoob / fake
@@ -1263,7 +1267,7 @@ class NoDPIEngine:
 
         mode_label = (
             "ByeDPI-стратегия" if self.strategy.active
-            else "Disorder (v2.3)" if not self.no_disorder
+            else "NoDPI v2.3 Disorder" if not self.no_disorder
             else "Standard (--no-disorder)"
         )
         self.log(f"Метод: {mode_label} | Режим: {self.mode}")
@@ -1273,7 +1277,7 @@ class NoDPIEngine:
             if self.strategy.errors:
                 self.log("Стратегия: ошибки: " + "; ".join(self.strategy.errors))
         elif self.strategy.text:
-            self.log("Стратегия не распознана, используется простая фрагментация")
+            self.log("Стратегия не распознана, используется метод NoDPI v2.3")
 
         # Без "async with": при выходе он вызывает wait_closed(), который
         # (Python 3.12+) ждёт закрытия ВСЕХ активных соединений и подвисает.
@@ -1525,7 +1529,7 @@ class NoDPIApp(App):
         # Стратегия обхода в формате ByeDPI (можно вставить из ByeByeDPI).
         root.add_widget(
             Label(
-                text="Стратегия (аргументы ByeDPI, пусто = простая):",
+                text="Стратегия (аргументы ByeDPI; пусто = NoDPI v2.3):",
                 size_hint_y=None,
                 height=dp(24),
             )

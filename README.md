@@ -23,7 +23,8 @@ TLS ClientHello (режим Disorder) по границе SNI.
 строки). Поддерживаются `-s/--split`, `-d/--disorder`, `-o/--oob`, `-q/--disoob`,
 `-f/--fake`, `-t/--ttl`, `-e/--oob-data`, `-r/--tlsrec`, `-m/--tlsminor` с позициями
 вида `1+s`, `-1`, `1:3:5`. Остальные аргументы принимаются и игнорируются. Пустое поле —
-простая фрагментация SNI. По умолчанию: `-d1 -s1+s -r1+s -e1 -m1 -o1+s -f-1 -t2 -a1`.
+оригинальный метод NoDPI v2.3 (GVCoder09/NoDPI): ClientHello режется на отдельные
+TLS-записи (до SNI, SNI по 2 символа, после SNI), первая часть уходит с TTL=1 (disorder). По умолчанию: `-d1 -s1+s -r1+s -e1 -m1 -o1+s -f-1 -t2 -a1`.
 Приёмы перенесены из [ByeDPI](https://github.com/hufrea/byedpi) (MIT).
 
 ## Сборка
