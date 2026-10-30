@@ -1,9 +1,13 @@
 import asyncio
+import ipaddress
+import json
 import os
 import random
 import socket
+import ssl
 import struct
 import threading
+import time
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -28,6 +32,17 @@ HELLO_TIMEOUT = 5.0
 # Если за это время пришёл RST/EOF/тишина - считаем, что домен блокируется DPI.
 AUTODETECT_TIMEOUT = 4.0
 
+# DNS-over-HTTPS: провайдеры часто подменяют DNS-ответы для заблокированных
+# доменов (YouTube и др.), поэтому имена разрешаем сами. К серверам идём по IP,
+# чтобы не зависеть от DNS. Формат: (ip, имя для SNI/Host, путь, порт).
+DOH_PROVIDERS = [
+    ("1.1.1.1", "cloudflare-dns.com", "/dns-query", 443),
+    ("8.8.8.8", "dns.google", "/resolve", 443),
+    ("1.0.0.1", "cloudflare-dns.com", "/dns-query", 443),
+    ("8.8.4.4", "dns.google", "/resolve", 443),
+]
+DOH_TIMEOUT = 4.0
+
 
 # =====================================================================
 # ЯДРО NODPI v2.3 (Асинхронный прокси с поддержкой Kyber и Disorder)
@@ -44,6 +59,7 @@ class NoDPIEngine:
         domains=None,
         log_cb=None,
         stopped_cb=None,
+        use_doh=True,
     ):
         self.host = host
         self.port = int(port)
@@ -53,6 +69,11 @@ class NoDPIEngine:
             d.strip().lower() for d in (domains or []) if d.strip()
         )
         self.autodetected = set()
+        self.use_doh = use_doh
+        self.doh_providers = list(DOH_PROVIDERS)
+        self._dns_cache = {}  # host -> (expires_at, [ip, ...])
+        self._dns_logged = set()
+        self._ssl_ctx = None
         self.log_cb = log_cb or (lambda msg: None)
         # Вызывается (из потока прокси), если сервер остановился сам - например,
         # из-за занятого порта. Нужен, чтобы интерфейс сбросил кнопку.
@@ -193,10 +214,154 @@ class NoDPIEngine:
 
         return header + body
 
-    async def open_remote(self, host: str, port: int):
-        return await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=10.0
+    # ---------------------------------------------------------------
+    # DNS-over-HTTPS
+    # ---------------------------------------------------------------
+
+    def _ssl_context(self):
+        if self._ssl_ctx is None:
+            cafile = None
+            try:
+                # На Android в системном хранилище нет путей OpenSSL, берём certifi.
+                import certifi
+
+                cafile = certifi.where()
+            except Exception:
+                pass
+            self._ssl_ctx = ssl.create_default_context(cafile=cafile)
+        return self._ssl_ctx
+
+    @staticmethod
+    def _dechunk(body: bytes) -> bytes:
+        out = bytearray()
+        while body:
+            size_line, _, rest = body.partition(b"\r\n")
+            try:
+                size = int(size_line.split(b";")[0].strip() or b"0", 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            out.extend(rest[:size])
+            body = rest[size + 2 :]
+        return bytes(out)
+
+    async def _doh_query(self, provider, name: str):
+        """Один DoH-запрос (JSON API). Возвращает ([ip, ...], ttl)."""
+        ip, sni, path, port = provider
+
+        reader, writer = await asyncio.open_connection(
+            ip, port, ssl=self._ssl_context(), server_hostname=sni
         )
+
+        try:
+            request = (
+                f"GET {path}?name={name}&type=A HTTP/1.1\r\n"
+                f"Host: {sni}\r\n"
+                "Accept: application/dns-json\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            writer.write(request.encode("ascii"))
+            await writer.drain()
+            raw = await reader.read()
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+        head, _, body = raw.partition(b"\r\n\r\n")
+
+        if b" 200" not in head.split(b"\r\n", 1)[0]:
+            raise OSError("DoH HTTP: " + head[:40].decode("latin1"))
+
+        if b"transfer-encoding: chunked" in head.lower():
+            body = self._dechunk(body)
+
+        data = json.loads(body.decode("utf-8"))
+        ips, ttl = [], 300
+
+        for ans in data.get("Answer", []):
+            if ans.get("type") == 1:
+                ips.append(ans["data"])
+                ttl = min(ttl, int(ans.get("TTL", 300))) if ttl else 300
+
+        return ips, max(ttl, 60)
+
+    async def resolve(self, host: str):
+        """Список IPv4-адресов для подключения (через DoH, иначе имя как есть)."""
+        try:
+            ipaddress.ip_address(host)
+            return [host]
+        except ValueError:
+            pass
+
+        if not self.use_doh:
+            return [host]
+
+        key = host.lower()
+        cached = self._dns_cache.get(key)
+
+        if cached and cached[0] > time.time():
+            return cached[1]
+
+        last_err = None
+
+        for provider in self.doh_providers:
+            try:
+                ips, ttl = await asyncio.wait_for(
+                    self._doh_query(provider, key), timeout=DOH_TIMEOUT
+                )
+            except Exception as e:
+                last_err = e
+                continue
+
+            if ips:
+                self._dns_cache[key] = (time.time() + ttl, ips)
+                await self._log_dns_mismatch(key, ips)
+                return ips
+
+        self.log(
+            f"[DNS] DoH не сработал для {host} "
+            f"({type(last_err).__name__ if last_err else 'нет ответа'}), "
+            "использую системный DNS"
+        )
+        return [host]
+
+    async def _log_dns_mismatch(self, host: str, doh_ips):
+        """Один раз на домен показываем, если системный DNS отдаёт другое (подмена)."""
+        if host in self._dns_logged:
+            return
+        self._dns_logged.add(host)
+
+        try:
+            loop = asyncio.get_running_loop()
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(host, None, family=socket.AF_INET), timeout=3.0
+            )
+            system_ips = sorted({i[4][0] for i in infos})
+        except Exception as e:
+            system_ips = [f"ошибка {type(e).__name__}"]
+
+        if not set(system_ips) & set(doh_ips):
+            self.log(
+                f"[DNS] {host}: системный DNS={','.join(system_ips)} "
+                f"отличается от DoH={','.join(doh_ips[:3])} - используем DoH"
+            )
+
+    async def open_remote(self, host: str, port: int):
+        ips = await self.resolve(host)
+        last_err = None
+
+        for ip in ips[:4]:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=8.0
+                )
+            except Exception as e:
+                last_err = e
+
+        raise last_err or OSError("не удалось подключиться")
 
     async def connect_with_autodetect(
         self,
@@ -378,9 +543,24 @@ class NoDPIEngine:
                     remote_reader, remote_writer = await self.open_remote(
                         host, port
                     )
-                except Exception:
+                except Exception as e:
+                    self.log(
+                        f"[Ошибка] не подключиться к {host}:{port} - "
+                        f"{type(e).__name__} {e}"
+                    )
+
                     if self.mode == "autodetect":
                         self.autodetected.add(host.lower())
+
+                    # Браузер увидит понятную ошибку шлюза, а не пустой ответ.
+                    try:
+                        client_writer.write(
+                            b"HTTP/1.1 502 Bad Gateway\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        await client_writer.drain()
+                    except Exception:
+                        pass
 
                     client_writer.close()
                     return
@@ -731,6 +911,17 @@ class NoDPIApp(App):
 
         root.add_widget(dis_box)
 
+        # DNS через DoH (обход подмены DNS провайдером)
+        doh_box = BoxLayout(size_hint_y=None, height=dp(40))
+        doh_box.add_widget(
+            Label(text="DNS через DoH (обход подмены DNS):", size_hint_x=0.75)
+        )
+
+        self.doh_switch = Switch(active=True, size_hint_x=0.25)
+        doh_box.add_widget(self.doh_switch)
+
+        root.add_widget(doh_box)
+
         # Системный прокси через VPN-сервис (для LTE). Только на Android.
         vpn_box = BoxLayout(size_hint_y=None, height=dp(40))
         vpn_box.add_widget(
@@ -902,6 +1093,7 @@ class NoDPIApp(App):
             domains=domains,
             log_cb=self.append_log,
             stopped_cb=self._on_engine_stopped,
+            use_doh=self.doh_switch.active,
         )
 
         self.engine.start_in_thread()
