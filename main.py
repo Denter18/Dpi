@@ -2,6 +2,9 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
+import shlex
+import tempfile
 import random
 import socket
 import ssl
@@ -58,6 +61,234 @@ STAGE_DEAD_SECONDS = 120
 
 
 # =====================================================================
+# СТРАТЕГИИ ОБХОДА В ФОРМАТЕ BYEDPI (ciadpi)
+# =====================================================================
+# Приёмы и их семантика перенесены из ByeDPI (https://github.com/hufrea/byedpi,
+# лицензия MIT): split, disorder, oob, disoob, fake, ttl, oob-data, tlsrec,
+# tlsminor. Строку аргументов можно вставить из ByeByeDPI как есть.
+
+# Поддельный ClientHello по умолчанию (tls_data из ByeDPI, 351 байт + нули до 517).
+FAKE_TLS = bytes.fromhex(
+    "1603010200010001fc0303035f6f2ced1322f8dcb2f260482d72666f57dd139d1b37dcfa"
+    "362ebaf992993a20f9df0c2e8a55898231631aefa8be0858a7a35a18d3965f045cb462af"
+    "89d70f8b003e130213031301c02cc030009fcca9cca8ccaac02bc02f009ec024c028006b"
+    "c023c0270067c00ac0140039c009c0130033009d009c003d003c0035002f00ff01000175"
+    "0000001600140000117777772e77696b6970656469612e6f7267000b000403000102000a"
+    "00160014001d0017001e00190018010001010102010301040010000e000c026832086874"
+    "74702f312e31001600000017000000310000000d002a0028040305030603080708080809"
+    "080a080b080408050806040105010601030303010302040205020602002b000908030403"
+    "0303020301002d00020101003300260024001d0020118cb88ce88a08901eee19d9dde8d4"
+    "06b1d1e2abe01663d6dcda84a4b84bfb0e001500ac000000000000"
+) + bytes(517 - 351)
+
+MODE_SPLIT, MODE_DISORDER, MODE_OOB, MODE_DISOOB, MODE_FAKE = (
+    "split", "disorder", "oob", "disoob", "fake",
+)
+
+_OPT_MODES = {
+    "s": MODE_SPLIT, "split": MODE_SPLIT,
+    "d": MODE_DISORDER, "disorder": MODE_DISORDER,
+    "o": MODE_OOB, "oob": MODE_OOB,
+    "q": MODE_DISOOB, "disoob": MODE_DISOOB,
+    "f": MODE_FAKE, "fake": MODE_FAKE,
+}
+_OPT_TLSREC = ("r", "tlsrec")
+_OPT_WITH_ARG = {
+    "t": "ttl", "ttl": "ttl", "e": "oob-data", "oob-data": "oob-data",
+    "m": "tlsminor", "tlsminor": "tlsminor",
+}
+# Принимаем, но не применяем (на Android без root недоступно или не нужно).
+_OPT_IGNORED_ARG = set("aAbcgiIjKlLMnOpQRTuVwHy") | {
+    "udp-fake", "auto", "buf-size", "max-conn", "def-ttl", "ip", "port",
+    "fake-data", "mod-http", "fake-sni", "fake-offset", "fake-tls-mod",
+    "auto-mode", "cache-ttl", "timeout", "proto", "hosts", "ipset", "round",
+    "conn-ip", "cache-dump", "pf", "pidfile",
+}
+_OPT_IGNORED_FLAG = set("YSNUFDE") | {
+    "drop-sack", "md5sig", "no-domain", "no-udp", "tfo", "daemon", "transparent",
+}
+
+
+class Part:
+    """Позиция разбиения: offset[:repeats:skip][+flags]."""
+
+    def __init__(self, mode, spec):
+        self.mode = mode
+        spec = spec.strip()
+        head, _, flags = spec.partition("+")
+        nums = head.split(":")
+        self.pos = int(nums[0] or 0)
+        self.repeats = int(nums[1]) if len(nums) > 1 and nums[1] else 1
+        self.skip = int(nums[2]) if len(nums) > 2 and nums[2] else 0
+        self.sni = "s" in flags
+        self.host = "h" in flags
+        self.end = "e" in flags
+        self.mid = "m" in flags
+        self.rand = "r" in flags
+        self.has_flags = bool(flags)
+
+    @property
+    def uses_host(self):
+        return self.sni or self.host
+
+
+class Strategy:
+    def __init__(self, text=""):
+        self.text = (text or "").strip()
+        self.parts = []
+        self.tlsrec = []
+        self.ttl = 8
+        self.oob_char = b"a"
+        self.tlsminor = None
+        self.ignored = []
+        self.errors = []
+        self._parse()
+
+    def _parse(self):
+        try:
+            tokens = shlex.split(self.text)
+        except ValueError as e:
+            self.errors.append(f"разбор строки: {e}")
+            return
+
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            i += 1
+
+            if not tok.startswith("-") or tok == "-":
+                self.errors.append(f"лишний аргумент {tok}")
+                continue
+
+            if tok.startswith("--"):
+                name, eq, val = tok[2:].partition("=")
+                has_val = bool(eq)
+            else:
+                name, val = tok[1], tok[2:]
+                has_val = bool(val)
+
+            def take():
+                nonlocal i, val, has_val
+                if has_val:
+                    return val
+                if i < len(tokens):
+                    i += 1
+                    return tokens[i - 1]
+                raise ValueError("нет значения у -" + name)
+
+            try:
+                if name in _OPT_MODES:
+                    self.parts.append(Part(_OPT_MODES[name], take()))
+                elif name in _OPT_TLSREC:
+                    self.tlsrec.append(Part(MODE_SPLIT, take()))
+                elif name in _OPT_WITH_ARG:
+                    key, v = _OPT_WITH_ARG[name], take()
+                    if key == "ttl":
+                        self.ttl = int(v)
+                    elif key == "oob-data":
+                        self.oob_char = (
+                            v.encode("latin1", "ignore")[:1] or b"a"
+                        )
+                    elif key == "tlsminor":
+                        self.tlsminor = int(v)
+                elif name in _OPT_IGNORED_ARG:
+                    take()
+                    self.ignored.append("-" + name)
+                elif name in _OPT_IGNORED_FLAG:
+                    self.ignored.append("-" + name)
+                else:
+                    self.ignored.append("-" + name)
+            except ValueError as e:
+                self.errors.append(str(e))
+
+    @property
+    def active(self):
+        return bool(self.parts or self.tlsrec or self.tlsminor is not None)
+
+
+def parse_tls_hello(data: bytes):
+    """(sni_pos, sni_len) для ClientHello; (0, 0) если SNI не найден."""
+    sni, pos = NoDPIEngine.extract_sni(data)
+    return (pos, len(sni)) if sni and pos > 0 else (0, 0)
+
+
+def gen_offset(part, n, lp, host_pos, host_len):
+    """Порт gen_offset из ByeDPI. -1 - позиция не определена."""
+    pos = part.pos
+
+    if part.uses_host:
+        if not host_pos or (part.sni and not host_len):
+            return -1
+        pos += host_pos
+        if part.end:
+            pos += host_len
+        elif part.mid:
+            pos += host_len // 2
+        elif part.rand:
+            pos += random.randrange(max(host_len, 1))
+    elif part.rand:
+        pos += lp + random.randrange(max(n - lp, 1))
+    elif part.mid:
+        pos += n // 2
+    elif pos < 0 or part.end:
+        pos += n
+
+    return pos
+
+
+def part_tls(buf: bytearray, base: int, n: int, pos: int) -> int:
+    """Порт part_tls: делит TLS-запись, начинающуюся с buf[base], на две."""
+    if n < 5 or pos < 0 or pos + 5 > n:
+        return 0
+
+    r_sz = struct.unpack_from("!H", buf, base + 3)[0]
+
+    if r_sz < pos:
+        return 0
+
+    buf[base + 5 + pos : base + 5 + pos] = bytes(buf[base : base + 3]) + b"\x00\x00"
+    struct.pack_into("!H", buf, base + 3, pos)
+    struct.pack_into("!H", buf, base + 5 + pos + 3, r_sz - pos)
+    return 5
+
+
+def apply_tls_tamper(strategy, data: bytes, host_pos: int, host_len: int):
+    """tlsminor и tlsrec из ByeDPI. Возвращает новый bytearray."""
+    buf = bytearray(data)
+    is_hello = len(buf) > 5 and buf[0] == 0x16 and buf[1] == 0x03 and buf[5] == 0x01
+
+    if not is_hello:
+        return buf
+
+    if strategy.tlsminor is not None:
+        buf[2] = strategy.tlsminor & 0xFF
+
+    lp, rc = 0, 0
+
+    for part in strategy.tlsrec:
+        for idx in range(part.repeats):
+            n = len(buf)
+            pos = rc * 5
+            pos += gen_offset(part, n - pos, lp, host_pos, host_len)
+
+            if part.pos < 0 or part.has_flags:
+                pos -= 5
+
+            pos += part.skip * idx
+
+            if pos < lp:
+                return buf
+
+            if not part_tls(buf, lp, n - lp, pos - lp):
+                return buf
+
+            lp = pos + 5
+            rc += 1
+
+    return buf
+
+
+# =====================================================================
 # ЯДРО NODPI v2.3 (Асинхронный прокси с поддержкой Kyber и Disorder)
 # =====================================================================
 
@@ -73,6 +304,9 @@ class NoDPIEngine:
         log_cb=None,
         stopped_cb=None,
         use_doh=True,
+        protect_cb=None,
+        tun_fd_cb=None,
+        tlsrec=True,
     ):
         self.host = host
         self.port = int(port)
@@ -83,6 +317,13 @@ class NoDPIEngine:
         )
         self.autodetected = set()
         self.use_doh = use_doh
+        # VPN-режим: protect_cb(fd) выводит сокет из туннеля (иначе петля),
+        # tun_fd_cb() отдаёт дескриптор TUN, когда Java-сервис его поднял.
+        self.protect_cb = protect_cb
+        self.tun_fd_cb = tun_fd_cb
+        self.tlsrec = tlsrec
+        self._tun_task = None
+        self.relay = None
         self.doh_providers = list(DOH_PROVIDERS)
         self.udp_servers = list(UDP_DNS_SERVERS)
         self._stage_dead = {}  # способ -> до какого времени не пробовать
@@ -193,6 +434,7 @@ class NoDPIEngine:
     @staticmethod
     async def read_full_client_hello(
         reader: asyncio.StreamReader,
+        timeout: float = HELLO_TIMEOUT,
     ) -> bytes:
         """Фича v2.3: Полное чтение TLS-записи ClientHello (для поддержки больших Kyber-пакетов).
 
@@ -203,7 +445,7 @@ class NoDPIEngine:
         try:
             # readexactly, а не read(5): read может вернуть меньше 5 байт.
             header = await asyncio.wait_for(
-                reader.readexactly(5), timeout=HELLO_TIMEOUT
+                reader.readexactly(5), timeout=timeout
             )
         except asyncio.IncompleteReadError as e:
             return e.partial
@@ -221,7 +463,7 @@ class NoDPIEngine:
 
         try:
             body = await asyncio.wait_for(
-                reader.readexactly(record_len), timeout=HELLO_TIMEOUT
+                reader.readexactly(record_len), timeout=timeout
             )
         except asyncio.IncompleteReadError as e:
             body = e.partial
@@ -262,12 +504,46 @@ class NoDPIEngine:
             body = rest[size + 2 :]
         return bytes(out)
 
+    def new_socket(self, kind: str, ip: str = "0.0.0.0"):
+        """Неблокирующий сокет; в VPN-режиме выведен из туннеля через protect()."""
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        sock = socket.socket(
+            family, socket.SOCK_STREAM if kind == "tcp" else socket.SOCK_DGRAM
+        )
+        sock.setblocking(False)
+
+        if self.protect_cb:
+            try:
+                self.protect_cb(sock.fileno())
+            except Exception:
+                pass
+
+        return sock
+
+    async def connect_tcp(self, ip, port, timeout=8.0, use_ssl=None, server_hostname=None):
+        sock = self.new_socket("tcp", ip)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.get_running_loop().sock_connect(sock, (ip, port)), timeout
+            )
+
+            if use_ssl is not None:
+                return await asyncio.open_connection(
+                    sock=sock, ssl=use_ssl, server_hostname=server_hostname
+                )
+
+            return await asyncio.open_connection(sock=sock)
+        except BaseException:
+            sock.close()
+            raise
+
     async def _doh_query(self, provider, name: str):
         """Один DoH-запрос (JSON API). Возвращает ([ip, ...], ttl)."""
         ip, host_header, path, port, tls_name = provider
 
-        reader, writer = await asyncio.open_connection(
-            ip, port, ssl=self._ssl_context(), server_hostname=tls_name
+        reader, writer = await self.connect_tcp(
+            ip, port, use_ssl=self._ssl_context(), server_hostname=tls_name
         )
 
         try:
@@ -386,9 +662,14 @@ class NoDPIEngine:
                 if not fut.done():
                     fut.set_exception(exc)
 
-        transport, proto = await loop.create_datagram_endpoint(
-            Proto, remote_addr=server
-        )
+        sock = self.new_socket("udp", server[0])
+
+        try:
+            sock.connect(server)
+            transport, proto = await loop.create_datagram_endpoint(Proto, sock=sock)
+        except BaseException:
+            sock.close()
+            raise
 
         try:
             return await fut
@@ -442,17 +723,8 @@ class NoDPIEngine:
 
         return [], 300, answered, last_err
 
-    async def resolve(self, host: str):
-        """Список IPv4-адресов для подключения."""
-        try:
-            ipaddress.ip_address(host)
-            return [host]
-        except ValueError:
-            pass
-
-        if not self.use_doh:
-            return [host]
-
+    async def resolve_ips(self, host: str):
+        """IPv4-адреса через DoH/UDP DNS. [] - записей нет, None - DNS недоступен."""
         key = host.lower()
         cached = self._dns_cache.get(key)
 
@@ -464,14 +736,18 @@ class NoDPIEngine:
             ("UDP DNS", UDP_TIMEOUT, lambda: [self._udp_query(s, key) for s in self.udp_servers]),
         )
 
-        for label, timeout, make in stages:
-            if self._stage_dead.get(label, 0) > time.time():
-                continue
+        alive = [x for x in stages if self._stage_dead.get(x[0], 0) <= time.time()]
+        # Если все способы «в паузе», всё равно пробуем - иначе DNS не будет совсем.
+        candidates = alive or list(stages)
+        any_answer = False
 
+        for label, timeout, make in candidates:
             ips, ttl, answered, err = await self._first_answer(make(), timeout)
+            any_answer = any_answer or answered
 
             if ips:
                 self._dns_cache[key] = (time.time() + ttl, ips)
+                self._stage_dead.pop(label, None)
 
                 if label not in self._stage_ok_logged:
                     self._stage_ok_logged.add(label)
@@ -488,12 +764,25 @@ class NoDPIEngine:
                     f"пауза {STAGE_DEAD_SECONDS} с"
                 )
 
-        return [host]
+        return [] if any_answer else None
+
+    async def resolve(self, host: str):
+        """Список адресов для подключения (при неудаче - имя как есть)."""
+        try:
+            ipaddress.ip_address(host)
+            return [host]
+        except ValueError:
+            pass
+
+        if not self.use_doh:
+            return [host]
+
+        return await self.resolve_ips(host) or [host]
 
     async def _log_dns_mismatch(self, host: str, found_ips):
         """Один раз на домен показываем, если системный DNS отдаёт другое (подмена)."""
-        if host in self._dns_logged:
-            return
+        if host in self._dns_logged or self.protect_cb:
+            return  # в VPN-режиме системный DNS и так идёт через нас
         self._dns_logged.add(host)
 
         try:
@@ -517,9 +806,7 @@ class NoDPIEngine:
 
         for ip in ips[:4]:
             try:
-                return await asyncio.wait_for(
-                    asyncio.open_connection(ip, port), timeout=8.0
-                )
+                return await self.connect_tcp(ip, port, timeout=8.0)
             except Exception as e:
                 last_err = e
 
@@ -599,6 +886,18 @@ class NoDPIEngine:
 
         mid = sni_pos + max(1, sni_len // 2)
 
+        if self.tlsrec and data[:1] == b"\x16" and 5 < mid < len(data):
+            # Разбиваем ClientHello на две TLS-записи прямо внутри SNI (допустимо
+            # по RFC 8446): DPI, который ищет SNI в одной записи, его не видит.
+            cut = mid - 5
+            head = data[1:3]
+            data = (
+                b"\x16" + head + struct.pack("!H", cut) + data[5:mid]
+                + b"\x16" + head + struct.pack("!H", len(data) - mid) + data[mid:]
+            )
+            sni_len += 5  # внутри SNI появился заголовок второй записи
+            mid += 5
+
         if self.no_disorder:
             # Базовая фрагментация ровно посередине SNI (--no-disorder)
             parts = [data[:mid], data[mid:]]
@@ -654,6 +953,103 @@ class NoDPIEngine:
             except Exception:
                 pass
 
+    async def serve_tunnel(self, client_reader, client_writer, host, port):
+        """Соединение из VPN-режима: адрес назначения известен заранее."""
+        await self._serve_connect(
+            client_reader, client_writer, host, port, http_connect=False
+        )
+
+    async def _serve_connect(
+        self, client_reader, client_writer, host, port, http_connect
+    ):
+        """Общая часть: подключиться к серверу, прочитать ClientHello, обойти DPI."""
+        remote_writer = None
+
+        try:
+            try:
+                remote_reader, remote_writer = await self.open_remote(host, port)
+            except Exception as e:
+                self.log(
+                    f"[Ошибка] не подключиться к {host}:{port} - "
+                    f"{type(e).__name__} {e}"
+                )
+
+                if self.mode == "autodetect":
+                    self.autodetected.add(host.lower())
+
+                if http_connect:
+                    # Браузер увидит понятную ошибку шлюза, а не пустой ответ.
+                    try:
+                        client_writer.write(
+                            b"HTTP/1.1 502 Bad Gateway\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        await client_writer.drain()
+                    except Exception:
+                        pass
+
+                return
+
+            if http_connect:
+                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await client_writer.drain()
+
+            # Протоколы, где первым говорит сервер, в VPN-режиме ждут недолго.
+            hello_timeout = HELLO_TIMEOUT if (http_connect or port in (443, 8443)) else 1.0
+
+            try:
+                ch_data = await self.read_full_client_hello(
+                    client_reader, hello_timeout
+                )
+            except Exception:
+                return
+
+            if ch_data:
+                sni, sni_pos = self.extract_sni(ch_data)
+                check_domain = sni or host
+                is_tls = sni_pos > 0
+
+                if is_tls and self.is_target_domain(check_domain):
+                    self.log(f"[DPI Bypass] {check_domain}")
+
+                    await self.send_fragmented_tls(
+                        remote_writer, ch_data, sni_pos, len(sni)
+                    )
+                elif is_tls and self.mode == "autodetect":
+                    # Домен ещё не известен как заблокированный: пробуем
+                    # без обхода, при сбое сами повторяем с обходом.
+                    (
+                        remote_reader,
+                        remote_writer,
+                    ) = await self.connect_with_autodetect(
+                        host,
+                        port,
+                        check_domain,
+                        ch_data,
+                        sni_pos,
+                        len(sni),
+                        remote_reader,
+                        remote_writer,
+                        client_writer,
+                    )
+                else:
+                    remote_writer.write(ch_data)
+                    await remote_writer.drain()
+
+            await asyncio.gather(
+                self.pipe(client_reader, remote_writer),
+                self.pipe(remote_reader, client_writer),
+            )
+        except Exception:
+            pass
+        finally:
+            for w in (client_writer, remote_writer):
+                if w:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+
     async def handle_client(
         self,
         client_reader: asyncio.StreamReader,
@@ -701,81 +1097,10 @@ class NoDPIEngine:
                 # IPv6-адрес приходит в скобках: [2001:db8::1]:443
                 host = host.strip("[]")
 
-                try:
-                    remote_reader, remote_writer = await self.open_remote(
-                        host, port
-                    )
-                except Exception as e:
-                    self.log(
-                        f"[Ошибка] не подключиться к {host}:{port} - "
-                        f"{type(e).__name__} {e}"
-                    )
-
-                    if self.mode == "autodetect":
-                        self.autodetected.add(host.lower())
-
-                    # Браузер увидит понятную ошибку шлюза, а не пустой ответ.
-                    try:
-                        client_writer.write(
-                            b"HTTP/1.1 502 Bad Gateway\r\n"
-                            b"Content-Length: 0\r\n\r\n"
-                        )
-                        await client_writer.drain()
-                    except Exception:
-                        pass
-
-                    client_writer.close()
-                    return
-
-                client_writer.write(
-                    b"HTTP/1.1 200 Connection Established\r\n\r\n"
+                await self._serve_connect(
+                    client_reader, client_writer, host, port, http_connect=True
                 )
-                await client_writer.drain()
-
-                # Читаем полностью ClientHello (v2.3)
-                try:
-                    ch_data = await self.read_full_client_hello(client_reader)
-                except Exception:
-                    client_writer.close()
-                    remote_writer.close()
-                    return
-
-                if ch_data:
-                    sni, sni_pos = self.extract_sni(ch_data)
-                    check_domain = sni or host
-                    is_tls = sni_pos > 0
-
-                    if is_tls and self.is_target_domain(check_domain):
-                        self.log(f"[DPI Bypass] {check_domain}")
-
-                        await self.send_fragmented_tls(
-                            remote_writer, ch_data, sni_pos, len(sni)
-                        )
-                    elif is_tls and self.mode == "autodetect":
-                        # Домен ещё не известен как заблокированный: пробуем
-                        # без обхода, при сбое сами повторяем с обходом.
-                        (
-                            remote_reader,
-                            remote_writer,
-                        ) = await self.connect_with_autodetect(
-                            host,
-                            port,
-                            check_domain,
-                            ch_data,
-                            sni_pos,
-                            len(sni),
-                            remote_reader,
-                            remote_writer,
-                            client_writer,
-                        )
-                    else:
-                        remote_writer.write(ch_data)
-                        await remote_writer.drain()
-
-                await asyncio.gather(
-                    self.pipe(client_reader, remote_writer),
-                    self.pipe(remote_reader, client_writer),
-                )
+                return
             else:
                 # Обычный HTTP-запрос
                 host = ""
@@ -837,12 +1162,57 @@ class NoDPIEngine:
         )
         self.log(f"Метод: {mode_label} | Режим: {self.mode}")
 
+        if self.tun_fd_cb:
+            self._tun_task = asyncio.get_running_loop().create_task(self._run_tun())
+
         # Без "async with": при выходе он вызывает wait_closed(), который
         # (Python 3.12+) ждёт закрытия ВСЕХ активных соединений и подвисает.
         try:
             await self.server.serve_forever()
         finally:
             self.server.close()
+
+            if self._tun_task:
+                self._tun_task.cancel()
+
+    async def _run_tun(self, listen_sock=None, udp_target=None):
+        """Ждёт, пока Java-сервис поднимет TUN, и запускает перенаправление трафика."""
+        from tunnel import TunRelay
+
+        fd, deadline, err_logged = -1, time.time() + 120, False
+
+        while self.running and time.time() < deadline:
+            try:
+                fd = int(self.tun_fd_cb())
+            except Exception as e:
+                fd = -1
+
+                if not err_logged:
+                    err_logged = True
+                    self.log(f"VPN: не получить дескриптор туннеля ({e})")
+
+            if fd >= 0:
+                break
+
+            await asyncio.sleep(0.2)
+
+        if fd < 0:
+            self.log("VPN: туннель не поднялся, работает только прокси")
+            return
+
+        relay = TunRelay(self, fd, listen_sock=listen_sock, udp_target=udp_target)
+
+        try:
+            await relay.start()
+            self.relay = relay
+            self.log("VPN: весь трафик идёт через NoDPI")
+            await asyncio.Event().wait()  # работаем, пока задачу не отменят
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log(f"VPN: ошибка туннеля ({type(e).__name__} {e})")
+        finally:
+            relay.stop()
 
     def start_in_thread(self):
         self.running = True
@@ -921,9 +1291,8 @@ class NoDPIEngine:
 class AndroidVpn:
     """Запуск/остановка Java-сервиса NoDpiVpnService (см. java_src/).
 
-    Сервис ничего не маршрутизирует, а только выставляет системный HTTP-прокси
-    на локальный адрес NoDPI - это нужно для работы в мобильной сети (LTE),
-    где прокси нельзя задать в настройках Wi-Fi.
+    Сервис поднимает VPN-интерфейс (маршрут 0.0.0.0/0) и отдаёт его дескриптор
+    движку: весь трафик устройства идёт через NoDPI без настройки прокси.
 
     Все обращения к Android API импортируются лениво и обёрнуты в try/except:
     на ПК (и при любой ошибке) приложение продолжает работать как обычный прокси.
@@ -935,13 +1304,33 @@ class AndroidVpn:
 
     def __init__(self, log_cb):
         self.log = log_cb
-        self._pending = None
+        self._cls = None
 
     @staticmethod
     def available():
         return platform == "android"
 
-    def start(self, host, port):
+    def _service_cls(self):
+        if self._cls is None:
+            from jnius import autoclass
+
+            self._cls = autoclass(self.SERVICE_CLASS)
+
+        return self._cls
+
+    # Вызываются из потока движка ---------------------------------------
+
+    def protect(self, fd):
+        """Вывести сокет из VPN (иначе исходящие соединения зациклятся)."""
+        return bool(self._service_cls().protectSocket(int(fd)))
+
+    def tun_fd(self):
+        """Дескриптор VPN-интерфейса или -1, пока он не поднят."""
+        return int(self._service_cls().getTunFd())
+
+    # -------------------------------------------------------------------
+
+    def start(self):
         if not self.available():
             return
 
@@ -953,13 +1342,11 @@ class AndroidVpn:
             vpn_service = autoclass("android.net.VpnService")
             current = activity_cls.mActivity
 
-            self._pending = (host, port)
-
             # Если разрешение на VPN ещё не выдано - система покажет диалог.
             prepare_intent = vpn_service.prepare(current)
 
             if prepare_intent is None:
-                self._launch(host, port)
+                self._launch()
             else:
                 activity.bind(on_activity_result=self._on_activity_result)
                 current.startActivityForResult(
@@ -971,8 +1358,6 @@ class AndroidVpn:
     def stop(self):
         if not self.available():
             return
-
-        self._pending = None
 
         try:
             from jnius import autoclass
@@ -999,14 +1384,12 @@ class AndroidVpn:
         except Exception:
             pass
 
-        pending, self._pending = self._pending, None
-
-        if result_code == self.RESULT_OK and pending:
-            self._launch(*pending)
+        if result_code == self.RESULT_OK:
+            self._launch()
         else:
-            self.log("VPN: разрешение не выдано, системный прокси не включён")
+            self.log("VPN: разрешение не выдано, работает только прокси")
 
-    def _launch(self, host, port):
+    def _launch(self):
         try:
             from jnius import autoclass
 
@@ -1016,12 +1399,7 @@ class AndroidVpn:
 
             intent = intent_cls()
             intent.setClassName(current.getPackageName(), self.SERVICE_CLASS)
-            # Строки, а не int: не зависим от выбора перегрузки putExtra.
-            intent.putExtra("HOST", str(host))
-            intent.putExtra("PORT", str(port))
             current.startService(intent)
-
-            self.log(f"VPN: системный прокси {host}:{port} включён")
         except Exception as e:
             self.log(f"VPN: не удалось запустить сервис ({e})")
 
@@ -1084,14 +1462,25 @@ class NoDPIApp(App):
 
         root.add_widget(doh_box)
 
-        # Системный прокси через VPN-сервис (для LTE). Только на Android.
+        # Разбиение TLS-записи (tlsrec): сильнее обходит DPI
+        rec_box = BoxLayout(size_hint_y=None, height=dp(40))
+        rec_box.add_widget(
+            Label(text="Разбиение TLS-записи (tlsrec):", size_hint_x=0.75)
+        )
+
+        self.tlsrec_switch = Switch(active=True, size_hint_x=0.25)
+        rec_box.add_widget(self.tlsrec_switch)
+
+        root.add_widget(rec_box)
+
+        # VPN: весь трафик через NoDPI, без настройки прокси (Wi-Fi и LTE).
         vpn_box = BoxLayout(size_hint_y=None, height=dp(40))
         vpn_box.add_widget(
-            Label(text="Системный прокси через VPN (LTE):", size_hint_x=0.75)
+            Label(text="VPN: весь трафик (без прокси):", size_hint_x=0.75)
         )
 
         self.vpn_switch = Switch(
-            active=False,
+            active=AndroidVpn.available(),
             size_hint_x=0.25,
             disabled=not AndroidVpn.available(),
         )
@@ -1154,7 +1543,7 @@ class NoDPIApp(App):
 
         # Лог работы
         self.log_label = Label(
-            text="Готов к запуску. Настройте прокси 127.0.0.1:8881 в Wi-Fi или браузере.\n",
+            text="Готов к запуску. Нажмите кнопку - в режиме VPN ничего настраивать не нужно.\n",
             size_hint_y=None,
             halign="left",
             valign="top",
@@ -1246,6 +1635,7 @@ class NoDPIApp(App):
 
         host = self.host_input.text.strip() or "127.0.0.1"
         domains = self.domains_input.text.splitlines()
+        use_vpn = bool(self.vpn_switch.active and AndroidVpn.available())
 
         self.engine = NoDPIEngine(
             host=host,
@@ -1256,14 +1646,16 @@ class NoDPIApp(App):
             log_cb=self.append_log,
             stopped_cb=self._on_engine_stopped,
             use_doh=self.doh_switch.active,
+            tlsrec=self.tlsrec_switch.active,
+            protect_cb=self.vpn.protect if use_vpn else None,
+            tun_fd_cb=self.vpn.tun_fd if use_vpn else None,
         )
 
         self.engine.start_in_thread()
         self._set_running_ui()
 
-        if self.vpn_switch.active and AndroidVpn.available():
-            # Системный прокси всегда указывает на локальный адрес.
-            self.vpn.start("127.0.0.1", port)
+        if use_vpn:
+            self.vpn.start()
             self.vpn_active = True
 
     def on_pause(self):
