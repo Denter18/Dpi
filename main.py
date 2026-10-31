@@ -534,16 +534,23 @@ class NoDPIEngine:
             await asyncio.wait_for(
                 asyncio.get_running_loop().sock_connect(sock, (ip, port)), timeout
             )
-
-            if use_ssl is not None:
-                return await asyncio.open_connection(
-                    sock=sock, ssl=use_ssl, server_hostname=server_hostname
-                )
-
-            return await asyncio.open_connection(sock=sock)
         except BaseException:
             sock.close()
             raise
+
+        # Дальше сокетом владеет транспорт asyncio: при отмене или ошибке он
+        # закроется сам. Закрывать sock вручную нельзя - номер дескриптора
+        # достанется новому соединению, пока старый транспорт ещё жив
+        # ("File descriptor N is used by transport").
+        if use_ssl is not None:
+            return await asyncio.open_connection(
+                sock=sock,
+                ssl=use_ssl,
+                server_hostname=server_hostname,
+                ssl_shutdown_timeout=1.0,
+            )
+
+        return await asyncio.open_connection(sock=sock)
 
     async def _doh_query(self, provider, name: str):
         """Один DoH-запрос (JSON API). Возвращает ([ip, ...], ttl)."""
@@ -1078,9 +1085,10 @@ class NoDPIEngine:
                     pos += part.skip * idx
 
                     if pos < 0 or pos < lp:
-                        self.log(
-                            f"[Стратегия] split отменён: pos={pos}, lp={lp}, n={n}"
-                        )
+                        if sni_pos > 0:
+                            self.log(
+                                f"[Стратегия] split отменён: pos={pos}, lp={lp}, n={n}"
+                            )
                         raise _StopDesync
 
                     pos = min(pos, n)
@@ -1121,8 +1129,19 @@ class NoDPIEngine:
         finally:
             sock.close()
 
+    def _note_once(self, key, message):
+        """Записать в лог сообщение один раз для каждого ключа (host:port)."""
+        seen = self.__dict__.setdefault("_noted", set())
+
+        if key not in seen and len(seen) < 500:
+            seen.add(key)
+            self.log(message)
+
     async def pipe(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        counter=None,
     ):
         try:
             while self.running:
@@ -1130,6 +1149,9 @@ class NoDPIEngine:
 
                 if not data:
                     break
+
+                if counter is not None:
+                    counter[0] += len(data)
 
                 writer.write(data)
                 await writer.drain()
@@ -1152,6 +1174,7 @@ class NoDPIEngine:
     ):
         """Общая часть: подключиться к серверу, прочитать ClientHello, обойти DPI."""
         remote_writer = None
+        ch_data = b""
 
         try:
             try:
@@ -1220,14 +1243,49 @@ class NoDPIEngine:
                         remote_writer,
                         client_writer,
                     )
+                elif (
+                    not is_tls
+                    and self.strategy.active
+                    and self.is_target_domain(host)
+                ):
+                    # Не TLS (например Telegram MTProto): ByeDPI применяет
+                    # стратегию к первому пакету любого протокола.
+                    self._note_once(
+                        ("nontls", host, port), f"[Не TLS] {host}:{port}"
+                    )
+
+                    try:
+                        extra = await asyncio.wait_for(
+                            client_reader.read(65536), 0.05
+                        )
+                    except asyncio.TimeoutError:
+                        extra = b""
+
+                    try:
+                        await self.send_desync(
+                            remote_writer, ch_data + extra, 0, 0
+                        )
+                    except Exception as e:
+                        self.log(
+                            f"[Стратегия] ошибка {type(e).__name__}: {e}"
+                        )
+                        return
                 else:
                     remote_writer.write(ch_data)
                     await remote_writer.drain()
 
+            down = [0]
+
             await asyncio.gather(
                 self.pipe(client_reader, remote_writer),
-                self.pipe(remote_reader, client_writer),
+                self.pipe(remote_reader, client_writer, down),
             )
+
+            if ch_data and down[0] == 0:
+                self._note_once(
+                    ("silent", host, port),
+                    f"[Тишина] {host}:{port} - сервер ничего не ответил",
+                )
         except Exception:
             pass
         finally:
