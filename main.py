@@ -1502,6 +1502,14 @@ class AndroidVpn:
     def __init__(self, log_cb):
         self.log = log_cb
         self._cls = None
+        # Класс приложения pyjnius находит только в главном потоке (в потоке
+        # движка работает системный загрузчик классов и даёт ClassNotFound),
+        # поэтому загружаем его здесь и дальше пользуемся готовой ссылкой.
+        if self.available():
+            try:
+                self._service_cls()
+            except Exception as e:
+                self.log(f"VPN: не найден класс сервиса ({e})")
 
     @staticmethod
     def available():
@@ -1535,6 +1543,7 @@ class AndroidVpn:
             from android import activity
             from jnius import autoclass
 
+            self._service_cls()
             activity_cls = autoclass("org.kivy.android.PythonActivity")
             vpn_service = autoclass("android.net.VpnService")
             current = activity_cls.mActivity
