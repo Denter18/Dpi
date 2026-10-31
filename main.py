@@ -12,6 +12,8 @@ import struct
 import threading
 import time
 
+import tgws
+
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
@@ -1169,12 +1171,179 @@ class NoDPIEngine:
             client_reader, client_writer, host, port, http_connect=False
         )
 
+    async def _telegram_bridge(self, client_reader, client_writer, host, port):
+        """Telegram: поток obfuscated2 заворачиваем в WebSocket (kwsN.web.telegram.org).
+
+        Прямые соединения с серверами Telegram режутся по сигнатуре MTProto, а
+        веб-шлюз открывается как обычный HTTPS. Если WebSocket не вышел -
+        подключаемся напрямую и отправляем уже прочитанные байты.
+        """
+        try:
+            first = await asyncio.wait_for(client_reader.readexactly(64), 5.0)
+        except asyncio.IncompleteReadError as e:
+            first = e.partial
+        except asyncio.TimeoutError:
+            first = b""
+
+        if len(first) == 64:
+            try:
+                first += await asyncio.wait_for(client_reader.read(65536), 0.05)
+            except asyncio.TimeoutError:
+                pass
+
+        info = tgws.parse_obfuscated_init(first) if len(first) >= 64 else None
+        ws = None
+        reply = None
+
+        if info is None:
+            self._note_once(
+                ("tg-plain", host, port),
+                f"[Telegram] {host}:{port} - не obfuscated2 "
+                f"(байт {first[:1].hex() or '-'}), напрямую",
+            )
+        elif time.time() < self.__dict__.get("_ws_dead_until", 0):
+            pass
+        else:
+            dc, media = info
+            errors = []
+
+            for name in tgws.ws_hosts(dc, media):
+                try:
+                    ips = await self.resolve(name)
+                    cand = None
+
+                    for ip in ips[:2]:
+                        try:
+                            r, w = await self.connect_tcp(
+                                ip,
+                                443,
+                                timeout=5.0,
+                                use_ssl=self._ssl_context(),
+                                server_hostname=name,
+                            )
+                            cand = tgws.WebSocket(r, w)
+                            break
+                        except Exception as e:
+                            errors.append(f"{name}: {type(e).__name__}")
+
+                    if cand is None:
+                        continue
+
+                    try:
+                        await asyncio.wait_for(cand.handshake(name), 5.0)
+                        cand.send(first)
+                        await cand.writer.drain()
+                        reply = await asyncio.wait_for(cand.recv(), 6.0)
+                    except Exception as e:
+                        errors.append(f"{name}: {type(e).__name__} {e}")
+                        reply = None
+
+                    if reply:
+                        ws = cand
+                        self._ws_fails = 0
+                        self._note_once(
+                            ("tg-ws", dc, media),
+                            f"[Telegram] DC{dc}{'m' if media else ''} через WebSocket {name}",
+                        )
+                        break
+
+                    cand.close()
+                except Exception as e:
+                    errors.append(f"{name}: {type(e).__name__}")
+
+            if ws is None:
+                fails = self.__dict__.get("_ws_fails", 0) + 1
+                self._ws_fails = fails
+                self.log(
+                    f"[Telegram] WebSocket DC{dc} не вышел ({'; '.join(errors[:3])}), напрямую"
+                )
+
+                if fails >= 3:
+                    self._ws_dead_until = time.time() + 120
+                    self._ws_fails = 0
+                    self.log("[Telegram] WebSocket отключён на 120 с")
+
+        if ws is not None:
+            try:
+                client_writer.write(reply)
+                await client_writer.drain()
+
+                async def up():
+                    while self.running:
+                        data = await client_reader.read(16384)
+
+                        if not data:
+                            break
+
+                        ws.send(data)
+                        await ws.writer.drain()
+
+                async def down():
+                    while self.running:
+                        data = await ws.recv()
+
+                        if data is None:
+                            break
+
+                        client_writer.write(data)
+                        await client_writer.drain()
+
+                tasks = [asyncio.ensure_future(up()), asyncio.ensure_future(down())]
+                _, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for t in pending:
+                    t.cancel()
+            except Exception:
+                pass
+            finally:
+                ws.close()
+                try:
+                    client_writer.close()
+                except Exception:
+                    pass
+
+            return
+
+        # Напрямую: тот же путь, что и обычное соединение.
+        remote_writer = None
+
+        try:
+            remote_reader, remote_writer = await self.open_remote(host, port)
+
+            if first:
+                remote_writer.write(first)
+                await remote_writer.drain()
+
+            await asyncio.gather(
+                self.pipe(client_reader, remote_writer),
+                self.pipe(remote_reader, client_writer),
+            )
+        except Exception as e:
+            self.log(f"[Ошибка] не подключиться к {host}:{port} - {type(e).__name__}")
+        finally:
+            for w in (client_writer, remote_writer):
+                if w:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+
     async def _serve_connect(
         self, client_reader, client_writer, host, port, http_connect
     ):
         """Общая часть: подключиться к серверу, прочитать ClientHello, обойти DPI."""
         remote_writer = None
         ch_data = b""
+
+        if (
+            not http_connect
+            and port in tgws.TG_PORTS
+            and tgws.is_telegram_ip(host)
+        ):
+            await self._telegram_bridge(client_reader, client_writer, host, port)
+            return
 
         try:
             try:
@@ -1271,6 +1440,12 @@ class NoDPIEngine:
                         )
                         return
                 else:
+                    if not is_tls:
+                        self._note_once(
+                            ("nontls", host, port),
+                            f"[Не TLS] {host}:{port} байт {ch_data[:1].hex()}",
+                        )
+
                     remote_writer.write(ch_data)
                     await remote_writer.drain()
 
@@ -1726,23 +1901,6 @@ class NoDPIApp(App):
 
         root.add_widget(doh_box)
 
-        # Стратегия обхода в формате ByeDPI (можно вставить из ByeByeDPI).
-        root.add_widget(
-            Label(
-                text="Стратегия (аргументы ByeDPI; пусто = NoDPI v2.3):",
-                size_hint_y=None,
-                height=dp(24),
-            )
-        )
-
-        self.strategy_input = TextInput(
-            text=DEFAULT_STRATEGY,
-            multiline=False,
-            size_hint_y=None,
-            height=dp(40),
-        )
-        root.add_widget(self.strategy_input)
-
         # VPN: весь трафик через NoDPI, без настройки прокси (Wi-Fi и LTE).
         vpn_box = BoxLayout(size_hint_y=None, height=dp(40))
         vpn_box.add_widget(
@@ -1916,7 +2074,7 @@ class NoDPIApp(App):
             log_cb=self.append_log,
             stopped_cb=self._on_engine_stopped,
             use_doh=self.doh_switch.active,
-            strategy=self.strategy_input.text,
+            strategy="",  # метод NoDPI v2.3 (ByeDPI-стратегии в UI отключены)
             protect_cb=self.vpn.protect if use_vpn else None,
             tun_fd_cb=self.vpn.tun_fd if use_vpn else None,
         )

@@ -25,6 +25,14 @@ TLS ClientHello (режим Disorder) по границе SNI.
 пакеты разбирает `tunnel.py`: TCP заворачивается в локальный сервер ядра,
 оригинальный адрес назначения берётся из таблицы потоков.
 
+## Telegram
+
+Серверы Telegram режутся по сигнатуре MTProto, поэтому в VPN-режиме поток
+Telegram (`tgws.py`) заворачивается в WebSocket на `kwsN.web.telegram.org`
+(обычный HTTPS). Номер дата-центра берётся из первых 64 байт потока. Если
+WebSocket не открылся, соединение идёт напрямую. В логе: `[Telegram] DCn через
+WebSocket ...` или причина отказа.
+
 ## Сборка
 
 APK собирается GitHub Actions (`.github/workflows/build_apk.yml`) при пуше в `main`/`master`
