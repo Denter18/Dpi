@@ -1183,6 +1183,60 @@ class NoDPIEngine:
             client_reader, client_writer, host, port, http_connect=False
         )
 
+    async def _tg_probe(self):
+        """Один раз проверяет, какие адреса Telegram и веб-шлюзов доступны."""
+        try:
+            targets = []
+
+            for name in ("kws2.web.telegram.org", "venus.web.telegram.org"):
+                ips = await self.resolve_ips(name)
+                self.log(f"[Telegram] DNS {name}: {', '.join(ips) if ips else ips}")
+
+                for ip in (ips or [])[:2]:
+                    targets.append((name, ip))
+
+            for ip in tgws.WS_IPS[2]:
+                targets.append(("kws2.web.telegram.org", ip))
+
+            seen = set()
+
+            async def one(name, ip):
+                t0 = time.time()
+
+                try:
+                    r, w = await self.connect_tcp(
+                        ip, 443, timeout=4.0,
+                        use_ssl=self._ws_ssl_context(), server_hostname=name,
+                    )
+                except Exception as e:
+                    self.log(f"[Telegram] {ip}: {type(e).__name__} {str(e)[:30]}")
+                    return
+
+                ms = int((time.time() - t0) * 1000)
+
+                try:
+                    ws = tgws.WebSocket(r, w)
+                    await asyncio.wait_for(ws.handshake(name), 4.0)
+                    self.log(f"[Telegram] {ip}: TLS+WS ок {ms}мс")
+                    ws.close()
+                except Exception as e:
+                    self.log(f"[Telegram] {ip}: TLS ок, WS: {str(e)[:40] or type(e).__name__}")
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+
+            jobs = []
+
+            for name, ip in targets:
+                if ip not in seen:
+                    seen.add(ip)
+                    jobs.append(one(name, ip))
+
+            await asyncio.gather(*jobs)
+        except Exception as e:
+            self.log(f"[Telegram] проверка не удалась: {type(e).__name__}")
+
     async def _telegram_bridge(self, client_reader, client_writer, host, port):
         """Telegram: поток obfuscated2 заворачиваем в WebSocket (kwsN.web.telegram.org).
 
@@ -1202,6 +1256,10 @@ class NoDPIEngine:
                 first += await asyncio.wait_for(client_reader.read(65536), 0.05)
             except asyncio.TimeoutError:
                 pass
+
+        if not self.__dict__.get("_tg_probed"):
+            self._tg_probed = True
+            asyncio.ensure_future(self._tg_probe())
 
         info = tgws.parse_obfuscated_init(first) if len(first) >= 64 else None
         ws = None
@@ -2008,10 +2066,10 @@ class NoDPIApp(App):
         self.tg_label = Label(
             text="Telegram: ждём соединений...",
             size_hint_y=None,
-            height=dp(76),
+            height=dp(150),
             halign="left",
             valign="top",
-            font_size=dp(11),
+            font_size=dp(10),
             color=(0.6, 0.85, 1, 1),
         )
         self.tg_label.bind(
@@ -2047,8 +2105,15 @@ class NoDPIApp(App):
     def append_log(self, msg):
         def _update(dt):
             if "[Telegram]" in msg or "149.154." in msg or "91.108." in msg:
-                self.tg_lines = (self.tg_lines + [msg[:140]])[-4:]
-                self.tg_label.text = "\n".join(self.tg_lines)
+                key = msg[:110]
+                counts = self.__dict__.setdefault("_tg_counts", {})
+                counts[key] = counts.get(key, 0) + 1
+                order = [k for k in self.tg_lines if k != key] + [key]
+                self.tg_lines = order[-9:]
+                self.tg_label.text = "\n".join(
+                    k + (f" (x{counts[k]})" if counts[k] > 1 else "")
+                    for k in self.tg_lines
+                )
 
             lines = (self.log_label.text + "\n" + msg).split("\n")[-60:]
             self.log_label.text = "\n".join(lines)
