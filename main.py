@@ -1131,6 +1131,18 @@ class NoDPIEngine:
         finally:
             sock.close()
 
+    def _ws_ssl_context(self):
+        """TLS к веб-шлюзу Telegram без проверки сертификата.
+
+        Сертификаты шлюзов (*.telegram.org, *.telesco.pe) не совпадают с именем
+        kwsN.web.telegram.org, поэтому клиенты их не проверяют. Содержимое
+        защищено собственным шифрованием Telegram (MTProto), а не этим TLS.
+        """
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
     def _note_once(self, key, message):
         """Записать в лог сообщение один раз для каждого ключа (host:port)."""
         seen = self.__dict__.setdefault("_noted", set())
@@ -1194,6 +1206,7 @@ class NoDPIEngine:
         info = tgws.parse_obfuscated_init(first) if len(first) >= 64 else None
         ws = None
         reply = None
+        ws_splitter = None
 
         if info is None:
             self._note_once(
@@ -1204,34 +1217,52 @@ class NoDPIEngine:
         elif time.time() < self.__dict__.get("_ws_dead_until", 0):
             pass
         else:
-            dc, media = info
+            dc, media, tag = info
             errors = []
 
             for name in tgws.ws_hosts(dc, media):
                 try:
-                    ips = await self.resolve(name)
+                    ips = [
+                        ip
+                        for ip in await self.resolve(name)
+                        if tgws.is_telegram_ip(ip)
+                    ]
+
+                    for ip in tgws.WS_IPS.get(dc, []):
+                        if ip not in ips:
+                            ips.append(ip)
+
                     cand = None
 
-                    for ip in ips[:2]:
+                    for ip in ips[:3]:
                         try:
                             r, w = await self.connect_tcp(
                                 ip,
                                 443,
-                                timeout=5.0,
-                                use_ssl=self._ssl_context(),
+                                timeout=4.0,
+                                use_ssl=self._ws_ssl_context(),
                                 server_hostname=name,
                             )
                             cand = tgws.WebSocket(r, w)
                             break
                         except Exception as e:
-                            errors.append(f"{name}: {type(e).__name__}")
+                            errors.append(
+                                f"{name}@{ip}: {type(e).__name__} {str(e)[:40]}"
+                            )
 
                     if cand is None:
                         continue
 
                     try:
                         await asyncio.wait_for(cand.handshake(name), 5.0)
-                        cand.send(first)
+                        splitter = tgws.PacketSplitter(first[:64], tag)
+                        chunks = splitter.feed(first[64:])
+                        head = first[:64] + (chunks[0] if chunks else b"")
+                        cand.send(head)
+
+                        for chunk in chunks[1:]:
+                            cand.send(chunk)
+
                         await cand.writer.drain()
                         reply = await asyncio.wait_for(cand.recv(), 6.0)
                     except Exception as e:
@@ -1240,6 +1271,7 @@ class NoDPIEngine:
 
                     if reply:
                         ws = cand
+                        ws_splitter = splitter
                         self._ws_fails = 0
                         self._note_once(
                             ("tg-ws", dc, media),
@@ -1275,7 +1307,9 @@ class NoDPIEngine:
                         if not data:
                             break
 
-                        ws.send(data)
+                        for chunk in ws_splitter.feed(data):
+                            ws.send(chunk)
+
                         await ws.writer.drain()
 
                 async def down():
@@ -1969,6 +2003,24 @@ class NoDPIApp(App):
         self.btn_toggle.bind(on_press=self.toggle_proxy)
         root.add_widget(self.btn_toggle)
 
+        # Отдельная панель: что делает Telegram (последние строки [Telegram]/149.154.x.x).
+        self.tg_lines = []
+        self.tg_label = Label(
+            text="Telegram: ждём соединений...",
+            size_hint_y=None,
+            height=dp(76),
+            halign="left",
+            valign="top",
+            font_size=dp(11),
+            color=(0.6, 0.85, 1, 1),
+        )
+        self.tg_label.bind(
+            width=lambda *x: self.tg_label.setter("text_size")(
+                self.tg_label, (self.tg_label.width, None)
+            )
+        )
+        root.add_widget(self.tg_label)
+
         # Лог работы
         self.log_label = Label(
             text="Готов к запуску. Нажмите кнопку - в режиме VPN ничего настраивать не нужно.\n",
@@ -1994,6 +2046,10 @@ class NoDPIApp(App):
 
     def append_log(self, msg):
         def _update(dt):
+            if "[Telegram]" in msg or "149.154." in msg or "91.108." in msg:
+                self.tg_lines = (self.tg_lines + [msg[:140]])[-4:]
+                self.tg_label.text = "\n".join(self.tg_lines)
+
             lines = (self.log_label.text + "\n" + msg).split("\n")[-60:]
             self.log_label.text = "\n".join(lines)
 

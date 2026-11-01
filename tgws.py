@@ -35,6 +35,16 @@ TG_PORTS = (443, 80, 5222)
 FALLBACK_NAMES = {1: "pluto", 2: "venus", 3: "aurora", 4: "vesta", 5: "flora"}
 
 
+# Адреса веб-шлюзов: DNS отдаёт только один из них, остальные зашиты в клиентах.
+WS_IPS = {
+    1: ["149.154.174.100"],
+    2: ["149.154.167.220", "149.154.167.99"],
+    3: ["149.154.174.100"],
+    4: ["149.154.167.220", "149.154.167.99"],
+    5: ["149.154.170.100"],
+}
+
+
 def is_telegram_ip(host: str) -> bool:
     try:
         ip = ipaddress.ip_address(host)
@@ -170,7 +180,86 @@ def parse_obfuscated_init(init: bytes):
     if not 1 <= abs(dc) <= 5:
         return None
 
-    return abs(dc), dc < 0
+    return abs(dc), dc < 0, plain[56:60]
+
+
+class PacketSplitter:
+    """Делит исходящий поток obfuscated2 на пакеты MTProto.
+
+    Шлюз ждёт в одном кадре WebSocket не больше одного пакета, лишние он молча
+    отбрасывает. Границы пакетов лежат в зашифрованном потоке, поэтому
+    расшифровываем только заголовки длины: остальное пропускаем, перепрыгивая
+    через нужное число блоков гамма-потока AES-CTR.
+    """
+
+    def __init__(self, init: bytes, tag: bytes):
+        self.rks = _expand_key(init[8:40])
+        self.iv = int.from_bytes(init[40:56], "big")
+        self.tag = tag
+        self.pos = 64  # смещение следующего байта в потоке
+        self.left = 0  # сколько байт текущего пакета ещё не отправлено
+        self.hdr = bytearray()  # накопленный (зашифрованный) заголовок длины
+        self._cache = (-1, b"")
+
+    def _ks(self, pos: int) -> int:
+        block, off = divmod(pos, 16)
+
+        if self._cache[0] != block:
+            ctr = ((self.iv + block) & ((1 << 128) - 1)).to_bytes(16, "big")
+            self._cache = (block, _encrypt_block(self.rks, ctr))
+
+        return self._cache[1][off]
+
+    def _plain(self, data: bytes, pos: int) -> bytes:
+        return bytes(b ^ self._ks(pos + i) for i, b in enumerate(data))
+
+    def feed(self, data: bytes):
+        """Список кусков; каждый содержит данные не более чем одного пакета."""
+        out = []
+        i = 0
+
+        while i < len(data):
+            if self.left > 0:
+                take = min(self.left, len(data) - i)
+                out.append(bytes(data[i : i + take]))
+                i += take
+                self.left -= take
+                self.pos += take
+                continue
+
+            # граница пакета: копим заголовок длины
+            self.hdr.append(data[i])
+            i += 1
+            n = len(self.hdr)
+            hpos = self.pos
+            plain = self._plain(bytes(self.hdr), hpos)
+
+            if self.tag == b"\xef\xef\xef\xef":
+                first = plain[0] & 0x7F
+
+                if first != 0x7F:
+                    hlen, length = 1, first * 4
+                elif n >= 4:
+                    hlen, length = 4, int.from_bytes(plain[1:4], "little") * 4
+                else:
+                    continue
+            else:
+                if n < 4:
+                    continue
+
+                hlen, length = 4, int.from_bytes(plain[:4], "little") & 0x7FFFFFFF
+
+            header = bytes(self.hdr)
+            self.hdr.clear()
+            self.pos += hlen
+            self.left = length
+            take = min(self.left, len(data) - i)
+            out.append(header + bytes(data[i : i + take]))
+            i += take
+            self.left -= take
+            self.pos += take
+
+        return out
 
 
 # --- WebSocket ----------------------------------------------------------
