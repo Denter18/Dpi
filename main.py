@@ -1266,30 +1266,48 @@ class NoDPIEngine:
         reply = None
         ws_splitter = None
 
-        if info is None:
+        if info is None and len(first) >= 64:
+            # Разбор не удался (формат потока другой?) - всё равно пробуем
+            # шлюз: он сам разберёт поток, дата-центр берём по адресу.
             self._note_once(
                 ("tg-plain", host, port),
-                f"[Telegram] {host}:{port} - не obfuscated2 "
-                f"(байт {first[:1].hex() or '-'}), напрямую",
+                f"[Telegram] {host}:{port} разбор init: {tgws.describe_init(first)}, "
+                f"байт {first[:1].hex()}; пробуем WS DC{tgws.dc_for_ip(host)}",
             )
+            info = (tgws.dc_for_ip(host), False, None)
+        elif info is None:
+            self._note_once(
+                ("tg-short", host, port),
+                f"[Telegram] {host}:{port} - первые байты короче 64 ({len(first)}), напрямую",
+            )
+
+        if info is None:
+            pass
         elif time.time() < self.__dict__.get("_ws_dead_until", 0):
             pass
         else:
             dc, media, tag = info
             errors = []
+            dead = self.__dict__.setdefault("_ip_dead", {})
 
             for name in tgws.ws_hosts(dc, media):
                 try:
-                    ips = [
-                        ip
-                        for ip in await self.resolve(name)
-                        if tgws.is_telegram_ip(ip)
-                    ]
+                    ips = []
+                    good = self.__dict__.get("_ws_good_ip")
 
-                    for ip in tgws.WS_IPS.get(dc, []):
+                    if good:
+                        ips.append(good)
+
+                    for ip in list(tgws.WS_IPS.get(dc, [])) + [
+                        i
+                        for i in await self.resolve(name)
+                        if tgws.is_telegram_ip(i)
+                    ]:
                         if ip not in ips:
                             ips.append(ip)
 
+                    ips = [i for i in ips if dead.get(i, 0) < time.time()]
+                    used_ip = None
                     cand = None
 
                     for ip in ips[:3]:
@@ -1302,8 +1320,10 @@ class NoDPIEngine:
                                 server_hostname=name,
                             )
                             cand = tgws.WebSocket(r, w)
+                            used_ip = ip
                             break
                         except Exception as e:
+                            dead[ip] = time.time() + 120
                             errors.append(
                                 f"{name}@{ip}: {type(e).__name__} {str(e)[:40]}"
                             )
@@ -1313,9 +1333,17 @@ class NoDPIEngine:
 
                     try:
                         await asyncio.wait_for(cand.handshake(name), 5.0)
-                        splitter = tgws.PacketSplitter(first[:64], tag)
-                        chunks = splitter.feed(first[64:])
-                        head = first[:64] + (chunks[0] if chunks else b"")
+                        splitter = (
+                            tgws.PacketSplitter(first[:64], tag) if tag else None
+                        )
+
+                        if splitter:
+                            chunks = splitter.feed(first[64:])
+                            head = first[:64] + (chunks[0] if chunks else b"")
+                        else:
+                            chunks = [first[64:]] if len(first) > 64 else []
+                            head = first[:64] + (chunks[0] if chunks else b"")
+
                         cand.send(head)
 
                         for chunk in chunks[1:]:
@@ -1330,6 +1358,7 @@ class NoDPIEngine:
                     if reply:
                         ws = cand
                         ws_splitter = splitter
+                        self._ws_good_ip = used_ip
                         self._ws_fails = 0
                         self._note_once(
                             ("tg-ws", dc, media),
@@ -1365,8 +1394,11 @@ class NoDPIEngine:
                         if not data:
                             break
 
-                        for chunk in ws_splitter.feed(data):
-                            ws.send(chunk)
+                        if ws_splitter:
+                            for chunk in ws_splitter.feed(data):
+                                ws.send(chunk)
+                        else:
+                            ws.send(data)
 
                         await ws.writer.drain()
 

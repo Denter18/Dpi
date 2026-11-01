@@ -183,6 +183,41 @@ def parse_obfuscated_init(init: bytes):
     return abs(dc), dc < 0, plain[56:60]
 
 
+def describe_init(init: bytes) -> str:
+    """Расшифрованные тег и dc из первых 64 байт - для отладочного лога."""
+    if len(init) < 64:
+        return "короче 64 байт"
+
+    ks = aes256_ctr_keystream(init[8:40], init[40:56], 64)
+    plain = bytes(a ^ b for a, b in zip(init[:64], ks))
+    return f"тег {plain[56:60].hex()} dc {struct.unpack('<h', plain[60:62])[0]}"
+
+
+def dc_for_ip(ip: str) -> int:
+    """Дата-центр по известным адресам серверов Telegram (запасной способ)."""
+    try:
+        a, b, c, d = (int(x) for x in ip.split("."))
+    except ValueError:
+        return 2
+
+    if (a, b) == (149, 154):
+        if c == 175:
+            return 1 if d < 100 else 3
+        if c == 167 and 90 <= d <= 99:
+            return 4
+        return 2
+
+    if (a, b) == (91, 108):
+        if c in (4, 5, 6, 7, 12, 13, 14, 15):
+            return 4
+        if c in (56, 57, 58, 59, 16, 17, 18, 19, 20, 21, 22, 23):
+            return 5
+        if c in (8, 9, 10, 11):
+            return 3
+
+    return 2
+
+
 class PacketSplitter:
     """Делит исходящий поток obfuscated2 на пакеты MTProto.
 
