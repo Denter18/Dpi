@@ -178,7 +178,9 @@ def parse_obfuscated_init(init: bytes):
     dc = struct.unpack("<h", plain[60:62])[0]
 
     if not 1 <= abs(dc) <= 5:
-        return None
+        # Без прокси Telegram не заполняет поле dc (там мусор): тег верный, поток
+        # настоящий, номер дата-центра вызывающий берёт по адресу сервера.
+        return None, False, plain[56:60]
 
     return abs(dc), dc < 0, plain[56:60]
 

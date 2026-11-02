@@ -1266,6 +1266,9 @@ class NoDPIEngine:
         reply = None
         ws_splitter = None
 
+        if info is not None and info[0] is None:
+            info = (tgws.dc_for_ip(host), False, info[2])
+
         if info is None and len(first) >= 64:
             # Разбор не удался (формат потока другой?) - всё равно пробуем
             # шлюз: он сам разберёт поток, дата-центр берём по адресу.
@@ -1323,7 +1326,7 @@ class NoDPIEngine:
                             used_ip = ip
                             break
                         except Exception as e:
-                            dead[ip] = time.time() + 120
+                            dead[ip] = time.time() + 45
                             errors.append(
                                 f"{name}@{ip}: {type(e).__name__} {str(e)[:40]}"
                             )
@@ -1378,9 +1381,9 @@ class NoDPIEngine:
                 )
 
                 if fails >= 3:
-                    self._ws_dead_until = time.time() + 120
+                    self._ws_dead_until = time.time() + 30
                     self._ws_fails = 0
-                    self.log("[Telegram] WebSocket отключён на 120 с")
+                    self.log("[Telegram] WebSocket отключён на 30 с")
 
         if ws is not None:
             try:
