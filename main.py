@@ -1237,6 +1237,96 @@ class NoDPIEngine:
         except Exception as e:
             self.log(f"[Telegram] проверка не удалась: {type(e).__name__}")
 
+    def _tg_stat(self, key, n=1):
+        """Счётчики Telegram; раз в 30 с выводим сводку в лог."""
+        st = self.__dict__.setdefault("_tg_stats", {})
+        st[key] = st.get(key, 0) + n
+        now = time.time()
+        last = self.__dict__.get("_tg_stats_t")
+
+        if last is None:
+            self._tg_stats_t = now
+        elif now - last >= 30 and (st.get("ws") or st.get("direct") or st.get("fail")):
+            self._tg_stats_t = now
+            self.log(
+                f"[Telegram] за 30с: WS {st.get('ws', 0)} (пул {st.get('pool', 0)}), "
+                f"напрямую {st.get('direct', 0)}, сбоев {st.get('fail', 0)}, "
+                f"{st.get('open_ms', 0) // max(st.get('ws', 1), 1)}мс на открытие, "
+                f"вниз {st.get('down', 0) // 1024}К вверх {st.get('up', 0) // 1024}К"
+            )
+            st.clear()
+
+    async def _tg_gateway_ips(self, dc, name):
+        ips = []
+        good = self.__dict__.get("_ws_good_ip")
+
+        if good:
+            ips.append(good)
+
+        try:
+            resolved = [i for i in await self.resolve(name) if tgws.is_telegram_ip(i)]
+        except Exception:
+            resolved = []
+
+        for ip in list(tgws.GATEWAY_IPS) + list(tgws.WS_IPS.get(dc, [])) + resolved:
+            if ip not in ips:
+                ips.append(ip)
+
+        return ips[:3]
+
+    def _tg_pool_take(self, dc):
+        """Готовое (уже открытое) WebSocket-соединение к шлюзу или None."""
+        pool = self.__dict__.setdefault("_tg_pool", {}).setdefault(dc, [])
+
+        while pool:
+            cand, ts = pool.pop()
+
+            if time.time() - ts < 20 and not cand.reader.at_eof():
+                return cand
+
+            cand.close()
+
+        return None
+
+    async def _tg_fill_pool(self, dc):
+        """Заранее открывает WebSocket к шлюзу: экономит 3-4 обмена на каждое соединение."""
+        filling = self.__dict__.setdefault("_tg_filling", set())
+
+        if dc in filling or not self.running:
+            return
+
+        filling.add(dc)
+
+        try:
+            pool = self.__dict__.setdefault("_tg_pool", {}).setdefault(dc, [])
+            unsupported = self.__dict__.setdefault("_tg_unsupported", {})
+            names = [
+                n for n in tgws.ws_hosts(dc, False) if unsupported.get(n, 0) < time.time()
+            ]
+
+            while names and len(pool) < 2:
+                name = names[0]
+                r, w, ip, _ = await self._tg_connect_gateway(
+                    name, await self._tg_gateway_ips(dc, name)
+                )
+
+                if r is None:
+                    return
+
+                cand = tgws.WebSocket(r, w)
+
+                try:
+                    await asyncio.wait_for(cand.handshake(name), 5.0)
+                except Exception:
+                    cand.close()
+                    return
+
+                pool.append((cand, time.time()))
+        except Exception:
+            pass
+        finally:
+            filling.discard(dc)
+
     async def _tg_connect_gateway(self, name, ips):
         """TLS к нескольким адресам шлюза сразу: берём первый, кто ответил."""
         errors = []
@@ -1245,7 +1335,7 @@ class NoDPIEngine:
                 self.connect_tcp(
                     ip,
                     443,
-                    timeout=6.0,
+                    timeout=5.0,
                     use_ssl=self._ws_ssl_context(),
                     server_hostname=name,
                 )
@@ -1297,6 +1387,40 @@ class NoDPIEngine:
         if now < state["pause"]:
             return None, None, None
 
+        # Готовое соединение из пула: рукопожатие уже сделано.
+        cand = self._tg_pool_take(dc)
+
+        if cand is not None:
+            t0 = time.time()
+
+            try:
+                splitter = tgws.PacketSplitter(first[:64], tag) if tag else None
+                chunks = (
+                    splitter.feed(first[64:])
+                    if splitter
+                    else ([first[64:]] if len(first) > 64 else [])
+                )
+                cand.send(first[:64] + (chunks[0] if chunks else b""))
+
+                for chunk in chunks[1:]:
+                    cand.send(chunk)
+
+                await cand.writer.drain()
+                reply = await asyncio.wait_for(cand.recv(), 6.0)
+            except Exception:
+                reply = None
+
+            if reply:
+                state["fails"] = 0
+                state["ok"] = time.time()
+                self._tg_stat("ws")
+                self._tg_stat("pool")
+                self._tg_stat("open_ms", int((time.time() - t0) * 1000))
+                asyncio.ensure_future(self._tg_fill_pool(dc))
+                return cand, reply, splitter
+
+            cand.close()
+
         names = [n for n in tgws.ws_hosts(dc, media) if unsupported.get(n, 0) < now]
         sem = self.__dict__.setdefault("_tg_sem", asyncio.Semaphore(4))
         errors = []
@@ -1307,28 +1431,10 @@ class NoDPIEngine:
                     if unsupported.get(name, 0) > time.time():
                         continue
 
-                    ips = []
-                    good = self.__dict__.get("_ws_good_ip")
+                    ips = await self._tg_gateway_ips(dc, name)
+                    t_open = time.time()
 
-                    if good:
-                        ips.append(good)
-
-                    try:
-                        resolved = [
-                            i for i in await self.resolve(name) if tgws.is_telegram_ip(i)
-                        ]
-                    except Exception:
-                        resolved = []
-
-                    for ip in (
-                        list(tgws.GATEWAY_IPS)
-                        + list(tgws.WS_IPS.get(dc, []))
-                        + resolved
-                    ):
-                        if ip not in ips:
-                            ips.append(ip)
-
-                    r, w, used_ip, errs = await self._tg_connect_gateway(name, ips[:3])
+                    r, w, used_ip, errs = await self._tg_connect_gateway(name, ips)
                     errors += [f"{name}@{e}" for e in errs[:2]]
 
                     if r is None:
@@ -1370,6 +1476,9 @@ class NoDPIEngine:
                     if reply:
                         state["fails"] = 0
                         state["ok"] = time.time()
+                        self._tg_stat("ws")
+                        self._tg_stat("open_ms", int((time.time() - t_open) * 1000))
+                        asyncio.ensure_future(self._tg_fill_pool(dc))
                         self._ws_good_ip = used_ip
                         self._note_once(
                             ("tg-ws", dc, media),
@@ -1382,6 +1491,7 @@ class NoDPIEngine:
                 await asyncio.sleep(0.3)
 
         state["fails"] += 1
+        self._tg_stat("fail")
 
         # Пауза только если DC давно не работал: иначе это случайный сбой сети.
         if state["fails"] >= 4 and time.time() - state["ok"] > 60:
@@ -1410,6 +1520,15 @@ class NoDPIEngine:
                 first += await asyncio.wait_for(client_reader.read(65536), 0.05)
             except asyncio.TimeoutError:
                 pass
+
+        if not first:
+            # Клиент ничего не прислал (закрыл соединение) - пробовать нечего.
+            try:
+                client_writer.close()
+            except Exception:
+                pass
+
+            return
 
         if not self.__dict__.get("_tg_probed"):
             self._tg_probed = True
@@ -1454,6 +1573,8 @@ class NoDPIEngine:
                         if not data:
                             break
 
+                        self._tg_stat("up", len(data))
+
                         if ws_splitter:
                             for chunk in ws_splitter.feed(data):
                                 ws.send(chunk)
@@ -1469,6 +1590,7 @@ class NoDPIEngine:
                         if data is None:
                             break
 
+                        self._tg_stat("down", len(data))
                         client_writer.write(data)
                         await client_writer.drain()
 
@@ -1492,9 +1614,22 @@ class NoDPIEngine:
 
         # Напрямую: тот же путь, что и обычное соединение.
         remote_writer = None
+        direct = self.__dict__.setdefault("_tg_direct", {"ok": 0, "fail": 0})
+
+        if direct["fail"] >= 3 and direct["ok"] == 0:
+            # Прямые адреса Telegram здесь не открываются: не держим клиента 8 с,
+            # а сразу закрываем - Telegram быстрее перейдёт на другое соединение.
+            self._note_once(
+                ("tg-nodirect",), "[Telegram] прямые адреса недоступны, только WebSocket"
+            )
+            self._tg_stat("fail")
+            client_writer.close()
+            return
 
         try:
             remote_reader, remote_writer = await self.open_remote(host, port)
+            direct["ok"] += 1
+            self._tg_stat("direct")
 
             if first:
                 remote_writer.write(first)
@@ -1505,6 +1640,9 @@ class NoDPIEngine:
                 self.pipe(remote_reader, client_writer),
             )
         except Exception as e:
+            if remote_writer is None:
+                direct["fail"] += 1
+
             self.log(f"[Ошибка] не подключиться к {host}:{port} - {type(e).__name__}")
         finally:
             for w in (client_writer, remote_writer):
