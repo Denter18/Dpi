@@ -1237,6 +1237,160 @@ class NoDPIEngine:
         except Exception as e:
             self.log(f"[Telegram] проверка не удалась: {type(e).__name__}")
 
+    async def _tg_connect_gateway(self, name, ips):
+        """TLS к нескольким адресам шлюза сразу: берём первый, кто ответил."""
+        errors = []
+        tasks = {
+            asyncio.ensure_future(
+                self.connect_tcp(
+                    ip,
+                    443,
+                    timeout=6.0,
+                    use_ssl=self._ws_ssl_context(),
+                    server_hostname=name,
+                )
+            ): ip
+            for ip in ips
+        }
+        pending = set(tasks)
+
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                winner = None
+
+                for t in done:
+                    try:
+                        r, w = t.result()
+                    except Exception as e:
+                        errors.append(f"{tasks[t]}: {type(e).__name__}")
+                        continue
+
+                    if winner is None:
+                        winner = (r, w, tasks[t])
+                    else:
+                        w.close()
+
+                if winner:
+                    return winner[0], winner[1], winner[2], errors
+        finally:
+            for t in pending:
+                t.cancel()
+
+        return None, None, None, errors
+
+    async def _tg_open_ws(self, dc, media, first, tag):
+        """Открывает WebSocket к шлюзу и отправляет первый пакет.
+
+        Возвращает (ws, первый ответ, splitter) или (None, None, None).
+        Состояние хранится по дата-центрам: сбой одного DC не отключает остальные,
+        а шлюзы без поддержки (HTTP 302) запоминаются отдельно.
+        """
+        now = time.time()
+        unsupported = self.__dict__.setdefault("_tg_unsupported", {})
+        state = self.__dict__.setdefault("_tg_dc_state", {}).setdefault(
+            dc, {"fails": 0, "ok": 0.0, "pause": 0.0}
+        )
+
+        if now < state["pause"]:
+            return None, None, None
+
+        names = [n for n in tgws.ws_hosts(dc, media) if unsupported.get(n, 0) < now]
+        sem = self.__dict__.setdefault("_tg_sem", asyncio.Semaphore(4))
+        errors = []
+
+        async with sem:
+            for attempt in range(2):
+                for name in names:
+                    if unsupported.get(name, 0) > time.time():
+                        continue
+
+                    ips = []
+                    good = self.__dict__.get("_ws_good_ip")
+
+                    if good:
+                        ips.append(good)
+
+                    try:
+                        resolved = [
+                            i for i in await self.resolve(name) if tgws.is_telegram_ip(i)
+                        ]
+                    except Exception:
+                        resolved = []
+
+                    for ip in (
+                        list(tgws.GATEWAY_IPS)
+                        + list(tgws.WS_IPS.get(dc, []))
+                        + resolved
+                    ):
+                        if ip not in ips:
+                            ips.append(ip)
+
+                    r, w, used_ip, errs = await self._tg_connect_gateway(name, ips[:3])
+                    errors += [f"{name}@{e}" for e in errs[:2]]
+
+                    if r is None:
+                        continue
+
+                    cand = tgws.WebSocket(r, w)
+
+                    try:
+                        await asyncio.wait_for(cand.handshake(name), 5.0)
+                    except Exception as e:
+                        errors.append(f"{name}: {str(e)[:40] or type(e).__name__}")
+
+                        if "HTTP/1.1 30" in str(e) or "HTTP/1.1 40" in str(e):
+                            unsupported[name] = time.time() + 300
+
+                        cand.close()
+                        continue
+
+                    try:
+                        splitter = tgws.PacketSplitter(first[:64], tag) if tag else None
+
+                        if splitter:
+                            chunks = splitter.feed(first[64:])
+                        else:
+                            chunks = [first[64:]] if len(first) > 64 else []
+
+                        cand.send(first[:64] + (chunks[0] if chunks else b""))
+
+                        for chunk in chunks[1:]:
+                            cand.send(chunk)
+
+                        await cand.writer.drain()
+                        reply = await asyncio.wait_for(cand.recv(), 6.0)
+                    except Exception as e:
+                        errors.append(f"{name}: {type(e).__name__}")
+                        cand.close()
+                        continue
+
+                    if reply:
+                        state["fails"] = 0
+                        state["ok"] = time.time()
+                        self._ws_good_ip = used_ip
+                        self._note_once(
+                            ("tg-ws", dc, media),
+                            f"[Telegram] DC{dc}{'m' if media else ''} через WebSocket {name}",
+                        )
+                        return cand, reply, splitter
+
+                    cand.close()
+
+                await asyncio.sleep(0.3)
+
+        state["fails"] += 1
+
+        # Пауза только если DC давно не работал: иначе это случайный сбой сети.
+        if state["fails"] >= 4 and time.time() - state["ok"] > 60:
+            state["pause"] = time.time() + 10
+            state["fails"] = 0
+
+        self.log(f"[Telegram] WebSocket DC{dc} не вышел ({'; '.join(errors[:3])}), напрямую")
+        return None, None, None
+
     async def _telegram_bridge(self, client_reader, client_writer, host, port):
         """Telegram: поток obfuscated2 заворачиваем в WebSocket (kwsN.web.telegram.org).
 
@@ -1284,106 +1438,9 @@ class NoDPIEngine:
                 f"[Telegram] {host}:{port} - первые байты короче 64 ({len(first)}), напрямую",
             )
 
-        if info is None:
-            pass
-        elif time.time() < self.__dict__.get("_ws_dead_until", 0):
-            pass
-        else:
+        if info is not None:
             dc, media, tag = info
-            errors = []
-            dead = self.__dict__.setdefault("_ip_dead", {})
-
-            for name in tgws.ws_hosts(dc, media):
-                try:
-                    ips = []
-                    good = self.__dict__.get("_ws_good_ip")
-
-                    if good:
-                        ips.append(good)
-
-                    for ip in list(tgws.WS_IPS.get(dc, [])) + [
-                        i
-                        for i in await self.resolve(name)
-                        if tgws.is_telegram_ip(i)
-                    ]:
-                        if ip not in ips:
-                            ips.append(ip)
-
-                    ips = [i for i in ips if dead.get(i, 0) < time.time()]
-                    used_ip = None
-                    cand = None
-
-                    for ip in ips[:3]:
-                        try:
-                            r, w = await self.connect_tcp(
-                                ip,
-                                443,
-                                timeout=4.0,
-                                use_ssl=self._ws_ssl_context(),
-                                server_hostname=name,
-                            )
-                            cand = tgws.WebSocket(r, w)
-                            used_ip = ip
-                            break
-                        except Exception as e:
-                            dead[ip] = time.time() + 45
-                            errors.append(
-                                f"{name}@{ip}: {type(e).__name__} {str(e)[:40]}"
-                            )
-
-                    if cand is None:
-                        continue
-
-                    try:
-                        await asyncio.wait_for(cand.handshake(name), 5.0)
-                        splitter = (
-                            tgws.PacketSplitter(first[:64], tag) if tag else None
-                        )
-
-                        if splitter:
-                            chunks = splitter.feed(first[64:])
-                            head = first[:64] + (chunks[0] if chunks else b"")
-                        else:
-                            chunks = [first[64:]] if len(first) > 64 else []
-                            head = first[:64] + (chunks[0] if chunks else b"")
-
-                        cand.send(head)
-
-                        for chunk in chunks[1:]:
-                            cand.send(chunk)
-
-                        await cand.writer.drain()
-                        reply = await asyncio.wait_for(cand.recv(), 6.0)
-                    except Exception as e:
-                        errors.append(f"{name}: {type(e).__name__} {e}")
-                        reply = None
-
-                    if reply:
-                        ws = cand
-                        ws_splitter = splitter
-                        self._ws_good_ip = used_ip
-                        self._ws_fails = 0
-                        self._note_once(
-                            ("tg-ws", dc, media),
-                            f"[Telegram] DC{dc}{'m' if media else ''} через WebSocket {name}",
-                        )
-                        break
-
-                    cand.close()
-                except Exception as e:
-                    errors.append(f"{name}: {type(e).__name__}")
-
-            if ws is None:
-                fails = self.__dict__.get("_ws_fails", 0) + 1
-                self._ws_fails = fails
-                self.log(
-                    f"[Telegram] WebSocket DC{dc} не вышел ({'; '.join(errors[:3])}), напрямую"
-                )
-
-                if fails >= 3:
-                    self._ws_dead_until = time.time() + 30
-                    self._ws_fails = 0
-                    self.log("[Telegram] WebSocket отключён на 30 с")
+            ws, reply, ws_splitter = await self._tg_open_ws(dc, media, first, tag)
 
         if ws is not None:
             try:
